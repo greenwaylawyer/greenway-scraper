@@ -1,0 +1,28 @@
+
+services:
+  scraper:
+    build: .
+    container_name: greenway_scraper
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./output:/app/output
+      - ./checkpoints:/app/checkpoints
+    # Option 1: connect to the host machine's port on Mac
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+    # Option 2: Join the Laravel backend network to directly talk to 'postgres:5432'
+    # Uncomment the following lines if the greenway_lawyer_portal backend is running
+    networks:
+      - greenway_network
+    # Keep container running without auto-executing scraper
+    # Run scraper on-demand: docker exec greenway_scraper python run.py --state california --export-scraper --layer state_bars
+    entrypoint: ["tail", "-f", "/dev/null"]
+
+# Uncomment if using Option 2 above (and change DB_HOST to 'postgres', DB_PORT to 5432 in .env)
+networks:
+  greenway_network:
+    name: greenway_lawyer_portal_greenway
+    external: true

@@ -1,0 +1,143 @@
+# Greenway Scraper - Enrichment Pipeline Configuration
+
+# Completeness threshold for promotion to portal database (0-100)
+completeness_threshold: 80
+
+# Scraper database (background enrichment pipeline)
+scraper_database:
+  host: ${SCRAPER_DB_HOST:-127.0.0.1}
+  port: ${SCRAPER_DB_PORT:-5433}
+  database: ${SCRAPER_DB_NAME:-greenway_scraper}
+  user: ${SCRAPER_DB_USER:-scraper}
+  password: ${SCRAPER_DB_PASSWORD:-secret}
+
+# Portal database (Laravel public-facing application)
+portal_database:
+  host: ${PORTAL_DB_HOST:-postgres}
+  port: ${PORTAL_DB_PORT:-5432}
+  database: ${PORTAL_DB_NAME:-greenway}
+  user: ${PORTAL_DB_USER:-greenway}
+  password: ${PORTAL_DB_PASSWORD:-secret}
+
+# Enrichment layers (run in order)
+enrichment_layers:
+  state_bars:
+    priority: 1
+    enabled: true
+    frequency: monthly
+    estimated_completeness_contribution: 40
+    description: "Official state bar association data"
+
+  justia:
+    priority: 2
+    enabled: true
+    frequency: weekly
+    estimated_completeness_contribution: 20
+    run_on_completeness_below: 80
+    description: "Justia.com lawyer directory"
+
+  courtlistener:
+    priority: 3
+    enabled: false  # Implement later
+    frequency: weekly
+    estimated_completeness_contribution: 10
+    run_on_completeness_below: 80
+    description: "CourtListener case history"
+
+  google_places:
+    priority: 4
+    enabled: false  # Implement later
+    frequency: weekly
+    estimated_completeness_contribution: 10
+    run_on_completeness_below: 80
+    api_key: ${GOOGLE_PLACES_API_KEY}
+    description: "Google Places reviews and ratings"
+
+# Merge strategy: which source wins for conflicting data
+merge_strategy:
+  # Field-level source priority (first = highest priority)
+  bar_number: [state_bars]  # Only trust state bars
+  license_status: [state_bars]
+  license_state: [state_bars]
+  admission_date: [state_bars, justia]
+
+  full_name: [state_bars, justia, google_places]
+  first_name: [state_bars, justia]
+  last_name: [state_bars, justia]
+
+  firm_name: [google_places, state_bars, justia]
+
+  address_line1: [google_places, state_bars, justia]
+  address_line2: [google_places, state_bars, justia]
+  city: [google_places, state_bars, justia]
+  state: [google_places, state_bars, justia]
+  zip: [google_places, state_bars, justia]
+
+  phone: [google_places, state_bars, justia]
+  fax: [state_bars, justia]
+  email: [google_places, justia, state_bars]
+  website_url: [google_places, justia, state_bars]
+
+  bio: [justia, google_places]
+  photo_url: [justia, google_places]
+  law_school: [state_bars, justia]
+  law_school_grad_year: [state_bars, justia]
+
+  # Special: merge from all sources (deduplicate)
+  practice_areas: merge_all
+
+# Completeness scoring weights (must sum to 100)
+completeness_weights:
+  full_name: 10
+  bar_number: 10
+  license_state: 5
+  license_status: 5
+  firm_name: 5
+  address_line1: 8
+  city: 5
+  state: 5
+  zip: 3
+  phone: 8
+  email: 8
+  website_url: 5
+  practice_areas: 10
+  bio: 8
+  photo_url: 5
+
+# Mandatory fields (must be present for promotion)
+mandatory_fields:
+  - full_name
+  - bar_number
+  - license_state
+
+# Promotion rules
+promotion:
+  auto_promote: true
+  min_completeness: 80
+
+  # Block promotion if these conditions are true
+  block_if:
+    - multiple_bar_numbers_detected
+    - conflicting_license_status
+    - missing_mandatory_field
+    - duplicate_detected
+
+  # Send to manual review queue if these are true
+  manual_review_if:
+    - completeness_between: [70, 79]
+    - source_count: 1  # Only one source of data
+    - critical_field_conflict: true
+
+# Monitoring & Progress Tracking
+monitoring:
+  enable_progress_tracking: true
+  progress_update_interval: 10  # Update progress every N records
+  save_snapshots: true
+  snapshot_interval: 100  # Save snapshot every N records
+
+# Performance settings
+performance:
+  batch_size: 100
+  parallel_enrichment_workers: 4
+  max_retries: 3
+  retry_delay_seconds: 5

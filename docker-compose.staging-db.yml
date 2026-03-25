@@ -1,0 +1,50 @@
+# Greenway Scraper - Staging Database with Docker Compose
+# This allows you to run the staging database in a container
+
+services:
+  staging_db:
+    image: postgres:16-alpine
+    container_name: greenway_staging_db
+    environment:
+      POSTGRES_DB: greenway_staging
+      POSTGRES_USER: scraper
+      POSTGRES_PASSWORD: scraper_secret
+    ports:
+      - "5433:5432"  # Map to different port to avoid conflict with production
+    volumes:
+      - staging_db_data:/var/lib/postgresql/data
+      - ./scripts/create_staging_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scraper -d greenway_staging"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - scraper_network
+
+  # Optional: PgAdmin for database management UI
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: greenway_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@greenway.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - scraper_network
+    depends_on:
+      - staging_db
+
+volumes:
+  staging_db_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+networks:
+  scraper_network:
+    driver: bridge

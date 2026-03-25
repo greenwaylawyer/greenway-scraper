@@ -1,0 +1,56 @@
+# Documentation — excluded per project policy
+*.md
+
+# Environment secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+.venv/
+venv/
+env/
+
+# Scraper output & checkpoints (large data files)
+output/
+checkpoints/
+
+# AI response cache
+.ai_cache.db
+
+# Screenshots & debug images
+*.png
+*.jpg
+*.jpeg
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude AI workfiles
+.claude/
+
+# Logs
+*.log
+logs/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/

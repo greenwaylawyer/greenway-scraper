@@ -1,0 +1,336 @@
+# State Bar Association Scraper Configuration
+# This file contains configuration for each state's bar association website
+
+california:
+  name: California State Bar
+  source: calbar
+  state_code: CA
+  base_url: "https://members.calbar.ca.gov"
+  search_url: "https://members.calbar.ca.gov/fal/Member/Detail/RSO"
+  rate_limit: 20  # requests per minute
+  has_search_api: false
+  pagination_type: query  # query, form_post, scroll, infinite
+  total_lawyers_estimate: 200000
+  requires_browser: true  # Uses Playwright
+  notes: |
+    California Bar website uses server-rendered HTML with minimal JavaScript.
+    Search results are displayed in a table format.
+    Need to inspect actual website to verify selectors.
+
+new_york:
+  name: New York State Courts
+  source: nybar
+  state_code: NY
+  base_url: "https://iapps.courts.state.ny.us/attorney"
+  search_url: "https://iapps.courts.state.ny.us/attorney/AttorneySearch"
+  rate_limit: 15
+  has_search_api: false
+  pagination_type: form_post
+  total_lawyers_estimate: 180000
+  requires_browser: true
+  notes: |
+    NY Courts uses form POST for pagination.
+    Attorney search requires navigating search filters.
+
+texas:
+  name: State Bar of Texas
+  source: texasbar
+  state_code: TX
+  base_url: "https://www.texasbar.com"
+  search_url: "https://www.texasbar.com/Am/Attorney/AttorneySearch"
+  rate_limit: 25
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 120000
+  requires_browser: true
+  notes: |
+    Texas Bar has a well-structured search interface.
+
+florida:
+  name: Florida Bar
+  source: flbar
+  state_code: FL
+  base_url: "https://www.floridabar.org"
+  search_url: "https://www.floridabar.org/directories/find-mbr/"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 110000
+  requires_browser: true
+  notes: |
+    Florida Bar member search is available publicly.
+
+illinois:
+  name: Illinois Attorney Registration
+  source: illinoisbar
+  state_code: IL
+  base_url: "https://www.iardc.org"
+  search_url: "https://www.iardc.org/lawyersearch"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 90000
+  requires_browser: true
+  notes: |
+    Illinois ARDC maintains the attorney registration database.
+
+pennsylvania:
+  name: Pennsylvania Bar Association
+  source: pabar
+  state_code: PA
+  base_url: "https://www.pabar.org"
+  search_url: "https://www.pabar.org/membership/member-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 70000
+  requires_browser: true
+  notes: |
+    Pennsylvania Bar member directory.
+
+ohio:
+  name: Ohio State Bar Association
+  source: ohiobar
+  state_code: OH
+  base_url: "https://www.ohiobar.org"
+  search_url: "https://www.ohiobar.org/for-public/attorney-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 50000
+  requires_browser: true
+  notes: |
+    Ohio State Bar attorney directory.
+
+georgia:
+  name: State Bar of Georgia
+  source: georgiabar
+  state_code: GA
+  base_url: "https://www.gabar.org"
+  search_url: "https://www.gabar.org/membersearch"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 50000
+  requires_browser: true
+  notes: |
+    Georgia Bar member search.
+
+north_carolina:
+  name: North Carolina State Bar
+  source: ncbar
+  state_code: NC
+  base_url: "https://www.ncbar.gov"
+  search_url: "https://www.ncbar.gov/for-the-public/lawyer-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 30000
+  requires_browser: true
+  notes: |
+    North Carolina State Bar lawyer directory.
+
+michigan:
+  name: State Bar of Michigan
+  source: michiganbar
+  state_code: MI
+  base_url: "https://www.michbar.org"
+  search_url: "https://www.michbar.org/for-public/attorney-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 45000
+  requires_browser: true
+  notes: |
+    Michigan State Bar attorney directory.
+
+new_jersey:
+  name: New Jersey State Bar Association
+  source: njbar
+  state_code: NJ
+  base_url: "https://www.njsba.com"
+  search_url: "https://www.njsba.com/for-the-public/attorney-member-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 60000
+  requires_browser: true
+  notes: |
+    New Jersey State Bar member directory.
+
+virginia:
+  name: Virginia State Bar
+  source: vabar
+  state_code: VA
+  base_url: "https://www.vsb.org"
+  search_url: "https://www.vsb.org/for-public/member-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 40000
+  requires_browser: true
+  notes: |
+    Virginia State Bar member directory.
+
+washington:
+  name: Washington State Bar Association
+  source: wsba
+  state_code: WA
+  base_url: "https://www.wsba.org"
+  search_url: "https://www.wsba.org/for-public/attorney-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 40000
+  requires_browser: true
+  notes: |
+    Washington State Bar attorney directory.
+
+arizona:
+  name: State Bar of Arizona
+  source: azbar
+  state_code: AZ
+  base_url: "https://www.azbar.org"
+  search_url: "https://www.azbar.org/AZAttorneySearch"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 25000
+  requires_browser: true
+  notes: |
+    Arizona Bar attorney search.
+
+massachusetts:
+  name: Massachusetts Bar Association
+  source: massbar
+  state_code: MA
+  base_url: "https://www.massbar.org"
+  search_url: "https://www.massbar.org/for-the-public/attorney-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 30000
+  requires_browser: true
+  notes: |
+    Massachusetts Bar attorney directory.
+
+indiana:
+  name: Indiana State Bar Association
+  source: inbar
+  state_code: IN
+  base_url: "https://www.inbar.org"
+  search_url: "https://www.inbar.org/for-the-public/member-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 20000
+  requires_browser: true
+  notes: |
+    Indiana State Bar member directory.
+
+missouri:
+  name: The Missouri Bar
+  source: mobar
+  state_code: MO
+  base_url: "https://www.mobar.org"
+  search_url: "https://www.mobar.org/for-the-public/attorney-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 25000
+  requires_browser: true
+  notes: |
+    Missouri Bar attorney directory.
+
+maryland:
+  name: Maryland State Bar Association
+  source: msba
+  state_code: MD
+  base_url: "https://www.msba.org"
+  search_url: "https://www.msba.org/for-the-public/attorney-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 35000
+  requires_browser: true
+  notes: |
+    Maryland State Bar attorney directory.
+
+wisconsin:
+  name: State Bar of Wisconsin
+  source: wibar
+  state_code: WI
+  base_url: "https://www.wisbar.org"
+  search_url: "https://www.wisbar.org/for-public/attorney-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 25000
+  requires_browser: true
+  notes: |
+    Wisconsin State Bar attorney directory.
+
+colorado:
+  name: Colorado Bar Association
+  source: cobar
+  state_code: CO
+  base_url: "https://www.cobar.org"
+  search_url: "https://www.cobar.org/for-the-public/attorney-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 30000
+  requires_browser: true
+  notes: |
+    Colorado Bar attorney directory.
+
+tennessee:
+  name: Tennessee Bar Association
+  source: tnbar
+  state_code: TN
+  base_url: "https://www.tnbar.org"
+  search_url: "https://www.tnbar.org/for-the-public/member-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 25000
+  requires_browser: true
+  notes: |
+    Tennessee Bar member directory.
+
+minnesota:
+  name: Minnesota State Bar Association
+  source: mnbar
+  state_code: MN
+  base_url: "https://www.mnbar.org"
+  search_url: "https://www.mnbar.org/for-the-public/attorney-directory"
+  rate_limit: 20
+  has_search_api: false
+  pagination_type: query
+  total_lawyers_estimate: 25000
+  requires_browser: true
+  notes: |
+    Minnesota State Bar attorney directory.
+
+# Enrichment Sources (not state bars)
+
+justia:
+  name: Justia Lawyer Directory
+  source: justia
+  base_url: "https://lawyers.justia.com"
+  rate_limit: 10
+  has_search_api: false
+  notes: |
+    Justia profiles for enrichment.
+    Must be respectful and check robots.txt.
+
+courtlistener:
+  name: CourtListener
+  source: courtlistener
+  base_url: "https://www.courtlistener.com"
+  api_url: "https://www.courtlistener.com/api/rest/v3/people/"
+  rate_limit: 100
+  has_search_api: true
+  api_key_required: false  # Free tier available
+  notes: |
+    CourtListener API for judicial biography enrichment.

@@ -1,0 +1,22 @@
+# Greenway Scraper - Python Dependencies
+
+# Core dependencies
+playwright==1.48.0
+beautifulsoup4==4.12.3
+aiohttp==3.11.10
+pyyaml==6.0.2
+python-dotenv==1.0.0
+
+# Database (optional - for direct DB import)
+psycopg2-binary==2.9.10
+
+# Logging
+structlog==24.4.0
+
+# AI enrichment (optional - requires ANTHROPIC_API_KEY env var)
+anthropic>=0.25.0
+
+# Testing (optional)
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-playwright==0.6.2
