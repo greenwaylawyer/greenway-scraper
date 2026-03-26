@@ -11,6 +11,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from scrapers.base import LawyerRawData
 from scrapers.enrichers.base_detail import BaseDetailEnricher
 from scrapers.enrichers.calbar_details import CaliforniaDetailEnricher
+from scrapers.enrichers.ncbar_details import NorthCarolinaDetailEnricher
 from utils.rate_limiter import TokenBucketRateLimiter
 from utils.logger import get_logger
 
@@ -311,7 +312,8 @@ def get_enricher_for_state(state_code: str) -> Optional[BaseDetailEnricher]:
     """
     if state_code == 'CA':
         return CaliforniaDetailEnricher()
-
+    if state_code == 'NC':
+        return NorthCarolinaDetailEnricher()
     # Add other states here as they're implemented
     # elif state_code == 'NY':
     #     return NewYorkDetailEnricher()

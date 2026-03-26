@@ -120,15 +120,27 @@ north_carolina:
   name: North Carolina State Bar
   source: ncbar
   state_code: NC
-  base_url: "https://www.ncbar.gov"
-  search_url: "https://www.ncbar.gov/for-the-public/lawyer-directory"
-  rate_limit: 20
+  base_url: "https://portal.ncbar.gov"
+  search_url: "https://portal.ncbar.gov/Verification/search.aspx"
+  detail_url_pattern: "https://portal.ncbar.gov/Verification/MemberDetail.aspx?id={bar_number}"
+  rate_limit: 15           # conservative — ASP.NET portal is slower than CA
   has_search_api: false
-  pagination_type: query
+  pagination_type: form_post   # ASP.NET WebForms postback
   total_lawyers_estimate: 30000
   requires_browser: true
+  search_strategy: last_name_prefix_2char   # aa→zz, auto-expands to 3-char on overflow
+  result_cap: 250
+  overflow_threshold: 245
   notes: |
-    North Carolina State Bar lawyer directory.
+    NC Bar portal is ASP.NET WebForms. Valid searches require one of:
+      - State Bar ID
+      - First 2 characters of Last Name (our primary sweep method)
+      - Board Certified Specialist
+      - Status + first 3 chars of City
+      - Judicial District + first 3 chars of City
+    We sweep aa→zz with Status=Active (676 searches).
+    Any bucket returning >= 245 results is automatically expanded to a
+    3-char sub-sweep (e.g., sma→smz) to avoid truncation at the 250-record cap.
 
 michigan:
   name: State Bar of Michigan

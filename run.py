@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from scrapers.states.california import StateBarCalifornia
+from scrapers.states.north_carolina import StateBarNorthCarolina
 from scrapers.base import LawyerRawData
 from scrapers.enrichers.detail_scraper import DetailPageScraper, get_enricher_for_state
 from pipeline.exporter import DataExporter
@@ -31,6 +32,7 @@ logger = get_logger(__name__)
 # Mapping of state codes to scraper classes
 SCRAPER_CLASSES = {
     'california': StateBarCalifornia,
+    'north_carolina': StateBarNorthCarolina,
     # Add more states as they're implemented:
     # 'new_york': StateBarNewYork,
     # 'texas': StateBarTexas,
