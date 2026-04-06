@@ -31,13 +31,33 @@ class BaseDetailEnricher(ABC):
             source=self.SOURCE,
         )
 
+    @property
+    def requires_browser_session(self) -> bool:
+        """Return True if this site requires an established browser session before accessing detail pages."""
+        return False
+
+    async def navigate_to_detail_page(self, page, detail_url: str, bar_number: str) -> None:
+        """
+        Navigate to a detail page. Override for sites that require a specific navigation
+        flow (e.g. going through search results before viewer pages are accessible).
+        Default: direct page.goto().
+        """
+        await page.goto(detail_url, wait_until='domcontentloaded', timeout=15000)
+
+    async def setup_browser_session(self, page) -> None:
+        """
+        Called once before detail page scraping begins.
+        Override to establish any required session state (e.g. visit a search form).
+        """
+        pass
+
     @abstractmethod
     async def parse_detail_page(
         self,
         page: Page,
         bar_number: str,
         existing_data: Optional[LawyerRawData] = None
-    ) -> LawyerRawData:
+    ) -> Optional[LawyerRawData]:
         """
         Parse a lawyer detail page and extract enriched data.
 
@@ -47,7 +67,7 @@ class BaseDetailEnricher(ABC):
             existing_data: Optional existing data to merge with
 
         Returns:
-            LawyerRawData with enriched information
+            LawyerRawData with enriched information, or None if profile not found
         """
         pass
 
@@ -207,8 +227,12 @@ class BaseDetailEnricher(ABC):
             page: Playwright page object
             timeout: Maximum wait time in milliseconds
         """
+        # Some directories keep analytics/network requests alive, so
+        # waiting for networkidle can hang. Prefer DOM readiness and a
+        # short settle delay for stable parsing.
         try:
-            await page.wait_for_load_state('networkidle', timeout=timeout)
+            await page.wait_for_load_state('domcontentloaded', timeout=timeout)
+            await page.wait_for_timeout(600)
         except Exception as e:
             logger.warning(
                 "Page load timeout",

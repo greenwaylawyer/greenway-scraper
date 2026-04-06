@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from scrapers.states.california import StateBarCalifornia
 from scrapers.states.north_carolina import StateBarNorthCarolina
+from scrapers.states.new_york import StateBarNewYork
 from scrapers.base import LawyerRawData
 from scrapers.enrichers.detail_scraper import DetailPageScraper, get_enricher_for_state
 from pipeline.exporter import DataExporter
@@ -33,11 +34,25 @@ logger = get_logger(__name__)
 SCRAPER_CLASSES = {
     'california': StateBarCalifornia,
     'north_carolina': StateBarNorthCarolina,
+    'new_york': StateBarNewYork,
     # Add more states as they're implemented:
-    # 'new_york': StateBarNewYork,
     # 'texas': StateBarTexas,
     # 'florida': StateBarFlorida,
 }
+
+# State code to abbreviation mapping
+STATE_ABBREVIATIONS = {
+    'california': 'CA',
+    'north_carolina': 'NC',
+    'new_york': 'NY',
+    'texas': 'TX',
+    'florida': 'FL',
+    # Add more as needed
+}
+
+def get_state_abbr(state_code: str) -> str:
+    """Get 2-letter state abbreviation from state code."""
+    return STATE_ABBREVIATIONS.get(state_code, state_code[:2].upper())
 
 
 def parse_args():
@@ -98,6 +113,12 @@ def parse_args():
     )
 
     parser.add_argument(
+        '--test',
+        action='store_true',
+        help='Test mode: limit to 5 records, disable checkpoint, enable JSON export (quick test run)',
+    )
+
+    parser.add_argument(
         '--start-page',
         type=int,
         default=1,
@@ -151,6 +172,7 @@ async def scrape_state(
     start_page: int = 1,
     headless: bool = True,
     checkpoint_enabled: bool = True,
+    limit: int = None,
 ) -> list[LawyerRawData]:
     """
     Scrape a single state.
@@ -163,6 +185,7 @@ async def scrape_state(
         start_page: Page number to start from
         headless: Whether to run browser in headless mode
         checkpoint_enabled: Whether to enable checkpoint saving
+        limit: Maximum number of records to scrape (None = no limit)
 
     Returns:
         List of scraped lawyer data
@@ -186,7 +209,7 @@ async def scrape_state(
     batch_tracker = None
     if export_scraper:
         batch_tracker = BatchTracker(
-            state=state_code[:2].upper(),
+            state=get_state_abbr(state_code),
             layer_name=layer_name,
         )
         # Create batch record with 'running' status
@@ -207,6 +230,7 @@ async def scrape_state(
         headless=headless,
         checkpoint_enabled=checkpoint_enabled,
         batch_tracker=batch_tracker,
+        limit=limit,
     )
 
     # Run scraper
@@ -222,9 +246,25 @@ async def scrape_state(
                 batch_tracker.close()
             return []
 
+        # Print summary for test mode
+        if limit and len(lawyers) <= 10:
+            logger.info("=" * 60)
+            logger.info("📋 SCRAPED LAWYERS SUMMARY")
+            logger.info("=" * 60)
+            for i, lawyer in enumerate(lawyers, 1):
+                name = lawyer.full_name or "N/A"
+                bar = lawyer.bar_number or "N/A"
+                status = lawyer.license_status or "N/A"
+                detail_url = lawyer.detail_url or "N/A"
+                print(f"\n[{i}] {name}")
+                print(f"    Bar #: {bar}")
+                print(f"    Status: {status}")
+                print(f"    Profile: {detail_url}")
+            logger.info("=" * 60)
+
         # Export results
         exporter = DataExporter(
-            state=state_code[:2].upper(),  # First 2 chars as state code
+            state=get_state_abbr(state_code),  # First 2 chars as state code
             source=scraper.SOURCE,
             batch_id=batch_tracker.batch_id if batch_tracker else None,
         )
@@ -314,7 +354,7 @@ async def scrape_detail_pages(
     Returns:
         List of enriched lawyer data
     """
-    state_abbr = state_code[:2].upper()
+    state_abbr = get_state_abbr(state_code)
 
     # Get the appropriate enricher for this state
     enricher = get_enricher_for_state(state_abbr)
@@ -475,6 +515,7 @@ async def run_auto_mode(
             start_page=1,
             headless=headless,
             checkpoint_enabled=checkpoint_enabled,
+            limit=limit,
         )
         results['level_1'] = {
             'status': 'completed',
@@ -490,12 +531,15 @@ async def run_auto_mode(
     logger.info("=" * 60)
     logger.info("📄 Level 2: Detail Page Scraping")
     logger.info("=" * 60)
+    state_abbr = get_state_abbr(state_code)
+    _enricher = get_enricher_for_state(state_abbr)
+    detail_layer_name = _enricher.SOURCE if _enricher else f'{state_abbr.lower()}bar_details'
     try:
         level_2_lawyers = await scrape_detail_pages(
             state_code=state_code,
             export_json=export_json,
             export_scraper=export_scraper,
-            layer_name='calbar_details',
+            layer_name=detail_layer_name,
             headless=headless,
             limit=limit,
             source_level=1,
@@ -524,6 +568,15 @@ async def main():
     """Main entry point."""
     global args
     args = parse_args()
+
+    # Handle test mode - apply test-friendly defaults
+    if args.test:
+        logger.info("🧪 TEST MODE ENABLED - Limiting to 5 records, checkpoint disabled")
+        if args.limit is None:
+            args.limit = 5
+        args.no_checkpoint = True
+        if not args.export_json and not args.export_scraper:
+            args.export_json = True  # Default to JSON in test mode
 
     # Apply AI mode override (--ai / --no-ai flags take precedence over config/ai.yaml)
     if args.ai_enabled is not None:
@@ -562,11 +615,14 @@ async def main():
     # Manual level execution
     if args.level == 2:
         # Level 2: Detail page scraping
+        _state_abbr = get_state_abbr(args.state)
+        _enricher = get_enricher_for_state(_state_abbr)
+        _detail_layer = _enricher.SOURCE if _enricher else f'{_state_abbr.lower()}bar_details'
         lawyers = await scrape_detail_pages(
             state_code=args.state,
             export_json=args.export_json,
             export_scraper=args.export_scraper,
-            layer_name='calbar_details',
+            layer_name=_detail_layer,
             headless=args.headless,
             limit=args.limit,
             source_level=1,
@@ -585,6 +641,7 @@ async def main():
             start_page=args.start_page,
             headless=args.headless,
             checkpoint_enabled=checkpoint_enabled,
+            limit=args.limit,
         )
         logger.info(f"Scraped {len(lawyers)} lawyers from {args.state}")
         sys.exit(0)
@@ -602,6 +659,7 @@ async def main():
                 start_page=args.start_page,
                 headless=args.headless,
                 checkpoint_enabled=checkpoint_enabled,
+                limit=args.limit,
             )
             all_lawyers.extend(lawyers)
 

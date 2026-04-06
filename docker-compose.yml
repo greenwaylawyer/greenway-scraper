@@ -9,19 +9,31 @@ services:
       - .:/app
       - ./output:/app/output
       - ./checkpoints:/app/checkpoints
-    # Option 1: connect to the host machine's port on Mac
-    # extra_hosts:
-    #   - "host.docker.internal:host-gateway"
-
-    # Option 2: Join the Laravel backend network to directly talk to 'postgres:5432'
-    # Uncomment the following lines if the greenway_lawyer_portal backend is running
+    depends_on:
+      - flaresolverr
     networks:
       - greenway_network
     # Keep container running without auto-executing scraper
     # Run scraper on-demand: docker exec greenway_scraper python run.py --state california --export-scraper --layer state_bars
     entrypoint: ["tail", "-f", "/dev/null"]
 
-# Uncomment if using Option 2 above (and change DB_HOST to 'postgres', DB_PORT to 5432 in .env)
+  # FlareSolverr: handles Cloudflare-protected sites (e.g. Justia, Avvo).
+  # It launches a real Chrome browser internally and solves CF challenges,
+  # then returns plain HTML to the scraper via a simple HTTP API.
+  # API endpoint: http://flaresolverr:8191/v1
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: greenway_flaresolverr
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      - CAPTCHA_SOLVER=none
+    ports:
+      - "8191:8191"    # accessible from host at http://localhost:8191
+    networks:
+      - greenway_network
+
 networks:
   greenway_network:
     name: greenway_lawyer_portal_greenway

@@ -93,7 +93,7 @@ class AddressNormalizer:
         zip_code = None
 
         # Look for pattern: City, ST ZIP
-        csz_pattern = r',\s*([A-Za-z\s]+?),?\s+([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)?$'
+        csz_pattern = r',\s*([A-Za-z][A-Za-z\s]*?),?\s+([A-Za-z]{2})(?:\s+(\d{5}(?:-\d{4})?))?$'
         match = re.search(csz_pattern, address, re.IGNORECASE)
 
         if match:

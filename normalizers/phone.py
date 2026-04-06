@@ -63,5 +63,11 @@ class PhoneNormalizer:
             if len(digits) == 10:
                 return f"+1{digits}"
 
-        logger.warning("Could not normalize phone number", phone=phone)
+        # International number — keep the raw value (strip excessive whitespace)
+        # and log at debug level only (non-US formats are expected for NY attorneys abroad)
+        raw = " ".join(phone.split())
+        if raw:
+            logger.debug("Storing non-US phone number as-is", phone=raw)
+            return raw
+
         return None

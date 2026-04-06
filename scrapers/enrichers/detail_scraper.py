@@ -4,6 +4,8 @@ import asyncio
 import os
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import aiohttp
+from bs4 import BeautifulSoup
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
@@ -12,10 +14,63 @@ from scrapers.base import LawyerRawData
 from scrapers.enrichers.base_detail import BaseDetailEnricher
 from scrapers.enrichers.calbar_details import CaliforniaDetailEnricher
 from scrapers.enrichers.ncbar_details import NorthCarolinaDetailEnricher
+from scrapers.enrichers.nybar_details import NYBarDetailEnricher
 from utils.rate_limiter import TokenBucketRateLimiter
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _sanitize_detail_html(html: str) -> str:
+    """Remove remote assets/scripts so set_content does not block on third-party resources."""
+    soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup.find_all(['script', 'noscript', 'iframe', 'style', 'link']):
+        tag.decompose()
+    # Remove external image/media loads that could hang
+    for img in soup.find_all('img'):
+        img['src'] = ''
+    return str(soup)
+
+
+async def fetch_detail_html(detail_url: str, timeout_ms: int = 15000) -> str:
+    """Fetch detail HTML directly instead of relying on browser navigation."""
+    timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(detail_url, ssl=False) as response:
+            response.raise_for_status()
+            return await response.text()
+
+
+async def safe_page_goto(page: Page, detail_url: str, timeout_ms: int = 15000) -> None:
+    """Navigate to a detail page without getting stuck on browser lifecycle waits."""
+    try:
+        raw_html = await fetch_detail_html(detail_url, timeout_ms=timeout_ms)
+        sanitized_html = _sanitize_detail_html(raw_html)
+        await page.set_content(sanitized_html, wait_until='commit', timeout=timeout_ms)
+    except Exception as exc:
+        logger.warning(
+            "Detail page HTML fetch fallback triggered",
+            detail_url=detail_url,
+            timeout_ms=timeout_ms,
+            error=str(exc),
+        )
+        # Final fallback: direct browser navigation.
+        try:
+            await page.goto(detail_url, wait_until='load', timeout=timeout_ms)
+        except Exception as nav_exc:
+            logger.warning(
+                "Detail page browser navigation fallback triggered",
+                detail_url=detail_url,
+                error=str(nav_exc),
+            )
+            try:
+                await asyncio.wait_for(page.wait_for_selector('body', timeout=5000), timeout=8)
+            except Exception:
+                await asyncio.wait_for(page.wait_for_selector('html', timeout=5000), timeout=8)
 
 # Load environment variables
 load_dotenv(override=True)
@@ -70,6 +125,7 @@ class DetailPageScraper:
             'processed': 0,
             'succeeded': 0,
             'failed': 0,
+            'not_found': 0,
             'skipped': 0,
             'start_time': None,
             'end_time': None,
@@ -116,7 +172,11 @@ class DetailPageScraper:
                         full_name,
                         license_state,
                         enrichment_level,
-                        merged_data
+                        merged_data,
+                        COALESCE(
+                            merged_data->>'detail_url',
+                            raw_data_by_source->'state_bars'->>'detail_url'
+                        ) AS detail_url
                     FROM lawyer_enrichment
                     WHERE license_state = %s
                       AND enrichment_level = %s
@@ -164,16 +224,26 @@ class DetailPageScraper:
             # Rate limiting
             await self.rate_limiter.acquire()
 
-            # Construct detail URL
-            detail_url = self.enricher.construct_detail_url(bar_number)
+            # Use stored detail_url from listing if available, otherwise construct from bar_number
+            detail_url = lawyer.get('detail_url') or self.enricher.construct_detail_url(bar_number)
 
             logger.debug(f"Navigating to detail page: {detail_url}")
 
             # Navigate to detail page
-            await self.page.goto(detail_url, wait_until='domcontentloaded', timeout=30000)
+            if self.enricher.requires_browser_session:
+                await self.enricher.navigate_to_detail_page(self.page, detail_url, bar_number)
+            else:
+                await safe_page_goto(self.page, detail_url, timeout_ms=15000)
 
             # Wait a bit for dynamic content
             await self.page.wait_for_timeout(1000)
+
+            logger.info(
+                "Detail page loaded",
+                bar_number=bar_number,
+                current_url=self.page.url,
+                title=(await self.page.title()),
+            )
 
             # Parse detail page
             # Create existing data object from database record
@@ -188,6 +258,16 @@ class DetailPageScraper:
                 bar_number,
                 existing_data
             )
+
+            # Check if profile was not found
+            if enriched_data is None:
+                logger.warning(
+                    f"Profile not found or no longer available",
+                    bar_number=bar_number,
+                    name=full_name,
+                )
+                self.stats['not_found'] += 1
+                return None
 
             logger.info(
                 f"Successfully scraped detail page",
@@ -217,6 +297,14 @@ class DetailPageScraper:
         """
         self.stats['start_time'] = datetime.now()
 
+        # Some enrichers are no-ops (e.g. NY Bar — data complete from CSV)
+        if getattr(self.enricher, 'skip_level_2', False):
+            logger.info(
+                "Level 2 skipped — data already complete from Level 1 source",
+                state=self.state_code,
+            )
+            return []
+
         # Fetch lawyers from database
         lawyers = self.fetch_lawyers_for_enrichment()
         self.stats['total_lawyers'] = len(lawyers)
@@ -243,6 +331,10 @@ class DetailPageScraper:
             )
 
             self.page = await self.context.new_page()
+
+            # Establish browser session if required (e.g. for ASP.NET session cookies)
+            if self.enricher.requires_browser_session:
+                await self.enricher.setup_browser_session(self.page)
 
             try:
                 # Process each lawyer
@@ -314,9 +406,8 @@ def get_enricher_for_state(state_code: str) -> Optional[BaseDetailEnricher]:
         return CaliforniaDetailEnricher()
     if state_code == 'NC':
         return NorthCarolinaDetailEnricher()
-    # Add other states here as they're implemented
-    # elif state_code == 'NY':
-    #     return NewYorkDetailEnricher()
+    if state_code == 'NY':
+        return NYBarDetailEnricher()
 
     logger.error(f"No detail enricher implemented for state: {state_code}")
     return None

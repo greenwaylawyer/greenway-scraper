@@ -223,6 +223,38 @@ class DataExporter:
         # Build dynamic level completion field name
         level_completed_field = f"level_{enrichment_level}_completed_at"
 
+        # Helper macro: wrap a scalar field update with manual-curation protection.
+        # When manually_curated=true AND the field name is in manually_curated_fields
+        # AND the incoming enrichment level is < 4 (i.e. not a reviews/ratings layer),
+        # the existing manually-curated value is preserved unchanged.
+        # For layer >= 4 (reviews, ratings, advanced) the guard is bypassed entirely
+        # so those fields are always refreshed from the scraper.
+        def _guarded(field: str, higher_level_expr: str, lower_level_expr: str) -> str:
+            """
+            Returns a CASE expression that:
+              1. Preserves the DB value when the field is manually curated (layers 1-3).
+              2. Otherwise applies the standard level-precedence logic.
+            """
+            return f"""CASE
+                    WHEN lawyer_enrichment.manually_curated
+                         AND (lawyer_enrichment.manually_curated_fields ? '{field}')
+                         AND %(enrichment_level)s < 4
+                    THEN lawyer_enrichment.{field}
+                    WHEN EXCLUDED.enrichment_level >= lawyer_enrichment.enrichment_level
+                    THEN {higher_level_expr}
+                    ELSE {lower_level_expr}
+                END"""
+
+        def _guarded_simple(field: str, coalesce_expr: str) -> str:
+            """For fields that don't use level-precedence (COALESCE only)."""
+            return f"""CASE
+                    WHEN lawyer_enrichment.manually_curated
+                         AND (lawyer_enrichment.manually_curated_fields ? '{field}')
+                         AND %(enrichment_level)s < 4
+                    THEN lawyer_enrichment.{field}
+                    ELSE {coalesce_expr}
+                END"""
+
         upsert_query = f"""
             INSERT INTO lawyer_enrichment (
                 fingerprint,
@@ -248,6 +280,7 @@ class DataExporter:
                 %(city)s, %(state)s
             )
             ON CONFLICT (fingerprint) DO UPDATE SET
+                -- ── Pipeline / meta fields — NEVER protected by manual curation ──────────
                 enrichment_layers = lawyer_enrichment.enrichment_layers || EXCLUDED.enrichment_layers,
                 enrichment_level = GREATEST(lawyer_enrichment.enrichment_level, EXCLUDED.enrichment_level),
                 {level_completed_field} = NOW(),
@@ -260,38 +293,56 @@ class DataExporter:
                 END,
                 -- Completeness score: always take the better score
                 completeness_score = GREATEST(EXCLUDED.completeness_score, lawyer_enrichment.completeness_score),
-                -- Scalar fields: higher-level data wins; fall back to existing non-null value
-                full_name = CASE
-                    WHEN EXCLUDED.enrichment_level >= lawyer_enrichment.enrichment_level
-                    THEN COALESCE(EXCLUDED.full_name, lawyer_enrichment.full_name)
-                    ELSE COALESCE(lawyer_enrichment.full_name, EXCLUDED.full_name)
-                END,
-                first_name = CASE
-                    WHEN EXCLUDED.enrichment_level >= lawyer_enrichment.enrichment_level
-                    THEN COALESCE(EXCLUDED.first_name, lawyer_enrichment.first_name)
-                    ELSE COALESCE(lawyer_enrichment.first_name, EXCLUDED.first_name)
-                END,
-                last_name = CASE
-                    WHEN EXCLUDED.enrichment_level >= lawyer_enrichment.enrichment_level
-                    THEN COALESCE(EXCLUDED.last_name, lawyer_enrichment.last_name)
-                    ELSE COALESCE(lawyer_enrichment.last_name, EXCLUDED.last_name)
-                END,
+
+                -- ── Scalar fields: protected when manually curated (layer < 4) ─────────
+                -- Name fields
+                full_name = {_guarded(
+                    'full_name',
+                    'COALESCE(EXCLUDED.full_name, lawyer_enrichment.full_name)',
+                    'COALESCE(lawyer_enrichment.full_name, EXCLUDED.full_name)',
+                )},
+                first_name = {_guarded(
+                    'first_name',
+                    'COALESCE(EXCLUDED.first_name, lawyer_enrichment.first_name)',
+                    'COALESCE(lawyer_enrichment.first_name, EXCLUDED.first_name)',
+                )},
+                last_name = {_guarded(
+                    'last_name',
+                    'COALESCE(EXCLUDED.last_name, lawyer_enrichment.last_name)',
+                    'COALESCE(lawyer_enrichment.last_name, EXCLUDED.last_name)',
+                )},
+
+                -- Identity (bar_number / license_state never overwritten — always keep first value)
                 bar_number = COALESCE(lawyer_enrichment.bar_number, EXCLUDED.bar_number),
                 license_state = COALESCE(lawyer_enrichment.license_state, EXCLUDED.license_state),
-                -- License status: always take freshest value
-                license_status = COALESCE(EXCLUDED.license_status, lawyer_enrichment.license_status),
-                admission_date = COALESCE(lawyer_enrichment.admission_date, EXCLUDED.admission_date),
-                firm_name = CASE
-                    WHEN EXCLUDED.enrichment_level >= lawyer_enrichment.enrichment_level
-                    THEN COALESCE(EXCLUDED.firm_name, lawyer_enrichment.firm_name)
-                    ELSE COALESCE(lawyer_enrichment.firm_name, EXCLUDED.firm_name)
-                END,
-                city = CASE
-                    WHEN EXCLUDED.enrichment_level >= lawyer_enrichment.enrichment_level
-                    THEN COALESCE(EXCLUDED.city, lawyer_enrichment.city)
-                    ELSE COALESCE(lawyer_enrichment.city, EXCLUDED.city)
-                END,
-                state = COALESCE(lawyer_enrichment.state, EXCLUDED.state),
+
+                -- License status: freshest value wins, but curated overrides
+                license_status = {_guarded_simple(
+                    'license_status',
+                    'COALESCE(EXCLUDED.license_status, lawyer_enrichment.license_status)',
+                )},
+
+                admission_date = {_guarded_simple(
+                    'admission_date',
+                    'COALESCE(lawyer_enrichment.admission_date, EXCLUDED.admission_date)',
+                )},
+
+                firm_name = {_guarded(
+                    'firm_name',
+                    'COALESCE(EXCLUDED.firm_name, lawyer_enrichment.firm_name)',
+                    'COALESCE(lawyer_enrichment.firm_name, EXCLUDED.firm_name)',
+                )},
+                city = {_guarded(
+                    'city',
+                    'COALESCE(EXCLUDED.city, lawyer_enrichment.city)',
+                    'COALESCE(lawyer_enrichment.city, EXCLUDED.city)',
+                )},
+                state = {_guarded_simple(
+                    'state',
+                    'COALESCE(lawyer_enrichment.state, EXCLUDED.state)',
+                )},
+
+                -- ── Always-updated pipeline timestamps ────────────────────────────────────
                 last_enriched_at = NOW(),
                 updated_at = NOW()
         """
@@ -343,6 +394,7 @@ class DataExporter:
                     'license_state': record.get('license_state'),
                     'license_status': record.get('license_status'),
                     'admission_date': record.get('admission_date'),
+                    'detail_url': record.get('detail_url'),
                 })
 
                 # Prepare insert data with only the columns that exist in the schema
@@ -475,6 +527,7 @@ class DataExporter:
             'source_id': lawyer.bar_number,
             'raw_data': {
                 'full_name': lawyer.full_name,
+                'middle_name': lawyer.middle_name,
                 'bar_number': lawyer.bar_number,
                 'firm_name': lawyer.firm_name,
                 'address': lawyer.address,
@@ -499,6 +552,10 @@ class DataExporter:
             'full_name': name_data.get('full_name'),
             'first_name': name_data.get('first_name'),
             'last_name': name_data.get('last_name'),
+            'middle_name': (
+                lawyer.middle_name                      # use field value if scraper provided it
+                or name_data.get('middle_name')         # fall back to what NameNormalizer parsed
+            ),
             'bar_number': lawyer.bar_number,
             'license_state': self.state.upper(),
             'license_status': lawyer.license_status,
@@ -513,6 +570,7 @@ class DataExporter:
             'fax': PhoneNormalizer.normalize(lawyer.fax),
             'email': lawyer.email,
             'website_url': lawyer.website_url,
+            'detail_url': lawyer.detail_url,
             'practice_areas': list(practice_areas_normalized) if practice_areas_normalized else None,
             'bio': lawyer.bio,
             'photo_url': lawyer.photo_url,

@@ -1,0 +1,128 @@
+# ============================================================================
+# Enrichment Source Configuration
+# ============================================================================
+# Defines all enrichment sources for Layers 3 and 4.
+# Each source_key here must match the key used in:
+#   - enrichment_source_requests.source_key
+#   - lawyer_enrichment.raw_data_by_source keys
+# ============================================================================
+
+sources:
+
+  # ==========================================================================
+  # Layer 3: Multi-Source Enrichment
+  # ==========================================================================
+
+  justia:
+    name: Justia
+    layer: 3
+    icon: justia
+    enabled: true
+    scraper_module: scrapers.enrichers.justia
+    scraper_class: JustiaEnricher
+    rate_limit: 10  # requests per minute
+    state_specific: false  # national scraper — works for all states
+    discovery:
+      strategies:
+        - name_city_search
+        - bar_number_search
+      auto_merge_on:
+        - bar_number  # auto-select if bar number matches
+      search_url_template: "https://lawyers.justia.com/search?query={name}&location={city}+{state}"
+      confidence_threshold: 0.90  # auto-select if confidence >= this
+    fields_provided:
+      - bio
+      - practice_areas
+      - education_history
+      - photo_url
+      - websites
+      - languages
+      - social_links
+
+  avvo:
+    name: Avvo
+    layer: 3
+    icon: avvo
+    enabled: true
+    scraper_module: scrapers.enrichers.avvo
+    scraper_class: AvvoEnricher
+    rate_limit: 8  # requests per minute
+    state_specific: false
+    discovery:
+      strategies:
+        - name_city_search
+        - phone_search
+      auto_merge_on:
+        - bar_number
+      search_url_template: "https://www.avvo.com/search/lawyer_search?q={name}&loc={city}+{state}"
+      confidence_threshold: 0.90
+    fields_provided:
+      - bio
+      - practice_areas
+      - work_history
+      - education_history
+      - professional_associations
+      - publications
+      - awards
+      - languages
+      - photo_url
+      - websites
+      - social_links
+
+  lawyers_com:
+    name: Lawyers.com
+    layer: 3
+    icon: lawyers_com
+    enabled: false  # Not yet implemented
+    scraper_module: scrapers.enrichers.lawyers_com
+    scraper_class: LawyersComEnricher
+    rate_limit: 10
+    state_specific: false
+    discovery:
+      strategies:
+        - name_city_search
+      auto_merge_on:
+        - bar_number
+      confidence_threshold: 0.90
+    fields_provided:
+      - bio
+      - practice_areas
+      - peer_reviews
+      - education_history
+      - websites
+
+  # ==========================================================================
+  # Layer 4: Reviews & Ratings
+  # ==========================================================================
+
+  google_maps:
+    name: Google Maps
+    layer: 4
+    icon: google
+    enabled: true
+    api_module: scrapers.enrichers.google_places
+    api_class: GooglePlacesEnricher
+    rate_limit: 50  # Places API rate limit
+    state_specific: false  # common for all states
+    min_completeness: 60  # only process profiles with score >= this
+    batch_size: 500  # profiles per manual trigger or scheduled run
+    refresh_interval_days: 30  # re-fetch ratings monthly
+    cost_per_1000_usd: 34  # approx cost for discovery + details
+    discovery:
+      strategies:
+        - places_api_search
+      auto_merge_on:
+        - address_match
+        - phone_match
+      verification_fields:
+        - formatted_address
+        - formatted_phone_number
+      confidence_threshold: 0.85
+    fields_provided:
+      - rating
+      - review_count
+      - reviews  # up to 5 most recent
+      - photos
+      - place_id
+      - google_maps_url
+      - formatted_phone_number  # for verification / gap-filling

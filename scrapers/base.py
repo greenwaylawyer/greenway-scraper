@@ -26,6 +26,7 @@ class PaginationInfo:
 class LawyerRawData:
     """Raw lawyer data extracted from a listing page."""
     full_name: str
+    middle_name: Optional[str] = None
     bar_number: Optional[str] = None
     firm_name: Optional[str] = None
     address: Optional[str] = None
@@ -65,7 +66,8 @@ class BaseScraper(ABC):
         start_page: int = 1,
         headless: bool = True,
         checkpoint_enabled: bool = True,
-        batch_tracker = None
+        batch_tracker = None,
+        limit: Optional[int] = None
     ):
         """
         Initialize the scraper.
@@ -75,11 +77,13 @@ class BaseScraper(ABC):
             headless: Whether to run browser in headless mode
             checkpoint_enabled: Whether to enable checkpoint saving
             batch_tracker: Optional BatchTracker instance for live status updates
+            limit: Maximum number of records to scrape (None = no limit, useful for testing)
         """
         self.start_page = start_page
         self.headless = headless
         self.checkpoint_enabled = checkpoint_enabled
         self.batch_tracker = batch_tracker
+        self.limit = limit
 
         # Initialize components
         self.rate_limiter = TokenBucketRateLimiter(rate=self.RATE_LIMIT)

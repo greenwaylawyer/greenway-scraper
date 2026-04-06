@@ -1,0 +1,31 @@
+# Layer 3 & 4 Enrichment Dependencies
+# Install with: python3 -m venv venv && source venv/bin/activate && pip install -r requirements-enrichment.txt
+
+# Web scraping
+playwright>=1.40.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# HTTP
+aiohttp>=3.9.0
+requests>=2.31.0
+
+# Database
+psycopg2-binary>=2.9.9
+
+# Configuration
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+aioresponses>=0.7.6  # For mocking aiohttp in tests
+
+# Type hints
+typing-extensions>=4.8.0
+
+# Note: If system pip is externally managed, use venv:
+#   python3 -m venv venv
+#   source venv/bin/activate  # or: venv\Scripts\activate on Windows
+#   pip install -r requirements-enrichment.txt

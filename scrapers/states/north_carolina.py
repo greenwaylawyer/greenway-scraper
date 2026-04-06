@@ -63,14 +63,17 @@ class StateBarNorthCarolina(BaseScraper):
     SOURCE = "ncbar"
     SEARCH_URL = "https://portal.ncbar.gov/Verification/search.aspx"
 
-    # ── Selectors (ASP.NET WebForms with generated IDs ending in field name) ─────
-    # We use partial-match attribute selectors ($=) so they survive master-page
-    # content placeholder prefixes like "ctl00$ContentPlaceHolder1$..."
-    SEL_LAST_NAME   = 'input[id$="txtLastName"], input[id$="LastName"], input[name$="txtLastName"]'
-    SEL_FIRST_NAME  = 'input[id$="txtFirstName"], input[id$="FirstName"]'
-    SEL_STATUS      = 'select[id$="ddlMemberStatus"], select[id$="MemberStatus"], select[name$="ddlMemberStatus"]'
-    SEL_CITY        = 'input[id$="txtCity"], input[id$="City"], input[name$="txtCity"]'
-    SEL_SEARCH_BTN  = 'input[type="submit"][id$="btnSearch"], input[type="submit"][value="Search"], input[type="submit"]'
+    # ── Confirmed selectors from live DOM inspection ─────────────────────────────
+    # Actual field IDs on portal.ncbar.gov/Verification/search.aspx:
+    #   txtFirst, txtMiddle, txtLast, txtCity, txtLicNum
+    #   ddState, ddJudicialDistrict, ddLicStatus (values: A=Active, I=Inactive…)
+    #   ddLicType, ddSpecialization
+    #   btnSubmit (type=submit, value="Search")
+    SEL_LAST_NAME   = '#txtLast'
+    SEL_FIRST_NAME  = '#txtFirst'
+    SEL_STATUS      = '#ddLicStatus'
+    SEL_CITY        = '#txtCity'
+    SEL_SEARCH_BTN  = '#btnSubmit'
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -109,34 +112,25 @@ class StateBarNorthCarolina(BaseScraper):
         # ── Last name prefix ────────────────────────────────────────────────────
         last_name_input = await page.query_selector(self.SEL_LAST_NAME)
         if not last_name_input:
-            # Fall back: find the input closest to a "Last Name" label
-            last_name_input = await page.query_selector('input[type="text"]:nth-of-type(3)')
-        if last_name_input:
-            await last_name_input.fill(last_name_prefix)
-        else:
-            logger.error("Could not find Last Name input on NC Bar search form")
+            logger.error(
+                "Could not find Last Name input (#txtLast) on NC Bar search form",
+                url=page.url,
+            )
             return
 
-        # ── Member Status = Active ──────────────────────────────────────────────
+        await last_name_input.fill(last_name_prefix)
+        logger.debug(f"Filled Last Name with: {last_name_prefix!r}")
+
+        # ── Member Status = Active (value='A') ──────────────────────────────────
         status_sel = await page.query_selector(self.SEL_STATUS)
         if status_sel:
             try:
-                await status_sel.select_option(label="Active")
-            except Exception:
-                try:
-                    await status_sel.select_option(value="Active")
-                except Exception:
-                    # Try by index – "Active" is usually option 1 or 2
-                    options = await status_sel.query_selector_all("option")
-                    for opt in options:
-                        text = (await opt.text_content() or "").strip()
-                        if "active" in text.lower():
-                            val = await opt.get_attribute("value")
-                            if val:
-                                await status_sel.select_option(value=val)
-                            break
+                await status_sel.select_option(value="A")
+                logger.debug("Set Status to Active (value='A')")
+            except Exception as e:
+                logger.warning(f"Could not set Status dropdown: {e}")
         else:
-            logger.warning("Could not locate Member Status dropdown; proceeding without it")
+            logger.warning("Member Status dropdown (#ddLicStatus) not found")
 
         # ── Optional city filter ────────────────────────────────────────────────
         if city_prefix:
@@ -149,75 +143,57 @@ class StateBarNorthCarolina(BaseScraper):
         if search_btn:
             await search_btn.click()
         else:
-            # ASP.NET fallback: press Enter in the last-name field
-            await last_name_input.press("Enter")
+            # Fallback: any submit button
+            fallback = await page.query_selector('input[type="submit"]')
+            if fallback:
+                await fallback.click()
+            else:
+                await last_name_input.press("Enter")
 
         await page.wait_for_load_state("networkidle", timeout=30000)
         await page.wait_for_timeout(800)
 
     async def _count_results(self, page: Page) -> int:
         """
-        Extract the number of results from the current search result page.
-        Returns 0 when no results section is visible.
+        Count results by reading the results table row count.
+
+        NC Bar returns a single <table class="table table-hover"> with
+        1 header row + up to 250 data rows.
         """
-        content = await page.content()
-
-        # Pattern 1: "250 Records Found" / "12 Results Found"
-        match = re.search(r'(\d+)\s+(?:Records?|Results?|Attorneys?|Members?)\s+(?:Found|Returned|Listed)', content, re.I)
-        if match:
-            return int(match.group(1))
-
-        # Pattern 2: count table rows directly
-        rows = await page.query_selector_all(
-            'table tr.GridRow, table tr.GridAltRow, '
-            'table tr[class*="row"], table tr[class*="odd"], table tr[class*="even"], '
-            'table.searchResults tr:not(:first-child)'
-        )
-        if rows:
-            return len(rows)
-
-        # Pattern 3: any data-bearing table (heuristic)
-        soup = BeautifulSoup(content, "html.parser")
+        soup = BeautifulSoup(await page.content(), "html.parser")
         table = self._find_results_table(soup)
-        if table:
-            data_rows = [r for r in table.find_all("tr") if r.find_all("td")]
-            return len(data_rows)
-
-        return 0
+        if not table:
+            return 0
+        data_rows = [r for r in table.find_all("tr") if r.find_all("td")]
+        return len(data_rows)
 
     # ── Core parsing ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _find_results_table(soup: BeautifulSoup):
         """
-        Locate the search results table in the page soup.
+        Locate the results table.
 
-        Tries multiple heuristics in priority order so the scraper is
-        resilient to minor HTML changes on the portal.
+        The NC Bar portal renders a single Bootstrap table:
+            <table class="table table-hover"> … </table>
+        with columns: Bar ID | Name | Type | Status | Location | Judicial District
         """
-        # 1. Table with a GridView id
-        t = soup.find("table", id=re.compile(r"GridView|gvResults|Grid|Results", re.I))
+        # Primary: Bootstrap table-hover (confirmed from live DOM)
+        t = soup.find("table", class_=lambda c: c and "table-hover" in c)
         if t:
             return t
 
-        # 2. Table by class
-        for cls_hint in ("grid", "searchresult", "result", "members"):
-            t = soup.find("table", class_=re.compile(cls_hint, re.I))
-            if t:
-                return t
-
-        # 3. Table that contains a MemberDetail link — strongest signal
+        # Fallback: any table with a "Bar ID" or "Name" column header
         for table in soup.find_all("table"):
-            if table.find("a", href=re.compile(r"MemberDetail|member|detail|profile|id=", re.I)):
+            headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+            if any(h in ("bar id", "name", "status") for h in headers):
                 return table
 
-        # 4. Largest table on the page (last resort)
+        # Last resort: largest table with data rows
         tables = soup.find_all("table")
-        if tables:
-            # Filter out navigation / layout tables (those with few columns)
-            data_tables = [t for t in tables if len(t.find_all("tr")) > 2 and t.find("td")]
-            if data_tables:
-                return max(data_tables, key=lambda t: len(t.find_all("tr")))
+        data_tables = [t for t in tables if len(t.find_all("tr")) > 2 and t.find("td")]
+        if data_tables:
+            return max(data_tables, key=lambda t: len(t.find_all("tr")))
 
         return None
 
@@ -225,8 +201,17 @@ class StateBarNorthCarolina(BaseScraper):
         """
         Parse the search results table for the current search.
 
-        NC Bar result columns (typical order):
-            Name | State Bar ID | Status | City | County
+        Confirmed NC Bar column order (table.table-hover):
+            Col 0: Bar ID          (plain number — this is the bar/license number)
+            Col 1: Name            (<a href="/Verification/viewer.aspx?ID=XXXXX">)
+            Col 2: Type            (Attorney, Judge, Corporation…)
+            Col 3: Status          (<span class="label label-success">Active</span>)
+            Col 4: Location        (City, ST)
+            Col 5: Judicial District
+
+        Note: the internal URL ID (`viewer.aspx?ID=...`) can differ from the
+        Bar ID — we always take the bar number from col 0 and the detail URL
+        from the href in col 1.
         """
         html = await page.content()
         soup = BeautifulSoup(html, "html.parser")
@@ -246,58 +231,43 @@ class StateBarNorthCarolina(BaseScraper):
                 if len(cols) < 2:
                     continue
 
-                # ── Detail URL ──────────────────────────────────────────────────
-                link = row.find("a", href=True)
+                # ── Col 0: Bar ID (license/bar number) ──────────────────────────
+                bar_number: Optional[str] = cols[0].get_text(strip=True) or None
+
+                # ── Col 1: Name + detail URL ─────────────────────────────────────
+                link = cols[1].find("a", href=True)
                 detail_url: Optional[str] = None
                 if link:
                     href = link["href"]
-                    if href.startswith("http"):
-                        detail_url = href
-                    elif href.startswith("/"):
-                        detail_url = f"{self.BASE_URL}{href}"
-                    else:
-                        detail_url = f"{self.BASE_URL}/Verification/{href}"
-
-                # ── Name ────────────────────────────────────────────────────────
-                # Name is always in the first column; strip trailing bar-ID text
-                full_name = cols[0].get_text(" ", strip=True)
-                # Some portals embed the bar number in the name cell: "Smith, John (12345)"
-                full_name = re.sub(r'\s*\(\d+\)\s*$', '', full_name).strip()
+                    detail_url = (
+                        href if href.startswith("http")
+                        else f"{self.BASE_URL}{href}"
+                    )
+                raw_name = cols[1].get_text(" ", strip=True)
+                full_name = self._clean_name(raw_name)
 
                 if not full_name:
                     continue
 
-                # ── Bar Number ──────────────────────────────────────────────────
-                # Try column 1 first; if it looks like a number, use it
-                bar_number: Optional[str] = None
-                if len(cols) > 1:
-                    candidate = cols[1].get_text(strip=True)
-                    if re.match(r'^\d+$', candidate):
-                        bar_number = candidate
-                    else:
-                        # Try reading bar number from the detail URL ?id=XXXXX
-                        if detail_url:
-                            m = re.search(r'[?&](?:id|memberid|barid)=(\d+)', detail_url, re.I)
-                            if m:
-                                bar_number = m.group(1)
-
-                # ── License Status ──────────────────────────────────────────────
+                # ── Col 3: Status (may be wrapped in <span>) ─────────────────────
                 license_status: Optional[str] = None
-                if len(cols) > 2:
-                    license_status = cols[2].get_text(strip=True) or None
-
-                # ── City ────────────────────────────────────────────────────────
-                # City alone is not a full address; Level 2 will retrieve full address
-                # (we still capture it for quick filtering)
-                city: Optional[str] = None
                 if len(cols) > 3:
-                    city = cols[3].get_text(strip=True) or None
+                    license_status = cols[3].get_text(strip=True) or None
+
+                # ── Col 4: Location (city only at Level 1) ───────────────────────
+                # We intentionally skip storing city-as-address; full address
+                # comes from Level 2 detail page scrape.
+
+                logger.debug(
+                    f"Parsed: name={full_name!r}  bar={bar_number!r}  "
+                    f"status={license_status!r}  url={detail_url!r}"
+                )
 
                 yield LawyerRawData(
                     full_name=full_name,
                     bar_number=bar_number,
                     license_status=license_status,
-                    address=None,       # Full address scraped in Level 2
+                    address=None,       # Full address comes from Level 2
                     detail_url=detail_url,
                     raw_html=str(row),
                 )
@@ -305,6 +275,25 @@ class StateBarNorthCarolina(BaseScraper):
             except Exception as exc:
                 logger.error("NC Bar: failed to parse result row", error=str(exc))
                 continue
+
+    @staticmethod
+    def _clean_name(raw: str) -> str:
+        """
+        Strip honorifics and extra whitespace from a name string.
+
+        Examples:
+            "Ms. Nana Asante-Smith"  → "Nana Asante-Smith"
+            "Mr. Peter F. Asmer, Jr." → "Peter F. Asmer, Jr."
+            "Judge Monica M. Bousman" → "Monica M. Bousman"
+        """
+        # Remove leading honorifics (Mr., Mrs., Ms., Dr., Judge, Hon., etc.)
+        cleaned = re.sub(
+            r'^(?:Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.|Judge|Hon\.|Sir|Lady)\s+',
+            '',
+            raw.strip(),
+            flags=re.I,
+        )
+        return cleaned.strip()
 
     async def get_pagination_info(self, page: Page) -> PaginationInfo:
         """
@@ -380,6 +369,11 @@ class StateBarNorthCarolina(BaseScraper):
 
                 # ── Main sweep ──────────────────────────────────────────────────
                 for prefix in prefixes:
+                    # Check limit
+                    if self.limit and len(all_lawyers) >= self.limit:
+                        logger.info(f"Limit reached ({self.limit} lawyers), stopping scrape")
+                        break
+
                     if resume_from and prefix <= resume_from:
                         continue
 
@@ -410,6 +404,9 @@ class StateBarNorthCarolina(BaseScraper):
                             # ── Normal: collect results for this prefix ─────────
                             async for lawyer in self.parse_listing(self.page):
                                 self._add_unique(all_lawyers, lawyer)
+                                # Check limit
+                                if self.limit and len(all_lawyers) >= self.limit:
+                                    break
 
                     except Exception as prefix_exc:
                         logger.error(f"Prefix '{prefix}' failed: {prefix_exc}")

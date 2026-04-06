@@ -1,45 +1,82 @@
-"""Structured logging configuration for Greenway Scraper."""
+"""Logging utility for greenway-scraper."""
 
-import structlog
 import logging
 import sys
-
-_configured = False
-
-
-def configure_structlog():
-    """Configure structured logging for the scraper."""
-    global _configured
-    if _configured:
-        return
-    _configured = True
-
-    # Reset any previous config and use native structlog (no stdlib integration)
-    structlog.reset_defaults()
-    structlog.configure(
-        processors=[
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.ExceptionRenderer(),
-            structlog.processors.UnicodeDecoder(),
-            structlog.dev.ConsoleRenderer(),
-        ],
-        context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
-        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-        cache_logger_on_first_use=True,
-    )
-
-    # Also configure standard logging for Playwright
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
-        stream=sys.stdout,
-    )
+import json
+from typing import Any, Mapping, Optional
 
 
-def get_logger(name: str):
-    """Get a structured logger instance."""
-    configure_structlog()
-    return structlog.get_logger(name)
+class StructuredLogger:
+    """
+    Thin wrapper around stdlib logging that supports structured kwargs:
+
+        logger.info("message", source="justia", batch_size=10)
+
+    Python's stdlib logger methods do not accept arbitrary kwargs, so we
+    merge them into the message as JSON.
+    """
+
+    def __init__(self, logger: logging.Logger):
+        self._logger = logger
+
+    def _format(self, msg: str, fields: Optional[Mapping[str, Any]] = None) -> str:
+        if not fields:
+            return msg
+        try:
+            return f"{msg} | {json.dumps(fields, default=str, ensure_ascii=False)}"
+        except Exception:
+            # Fallback: best-effort stringification
+            return f"{msg} | {fields}"
+
+    def debug(self, msg: str, **kwargs: Any) -> None:
+        self._logger.debug(self._format(msg, kwargs))
+
+    def info(self, msg: str, **kwargs: Any) -> None:
+        self._logger.info(self._format(msg, kwargs))
+
+    def warning(self, msg: str, **kwargs: Any) -> None:
+        self._logger.warning(self._format(msg, kwargs))
+
+    def error(self, msg: str, **kwargs: Any) -> None:
+        self._logger.error(self._format(msg, kwargs))
+
+    def exception(self, msg: str, **kwargs: Any) -> None:
+        self._logger.exception(self._format(msg, kwargs))
+
+    def critical(self, msg: str, **kwargs: Any) -> None:
+        self._logger.critical(self._format(msg, kwargs))
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._logger, item)
+
+
+def get_logger(name: str, level: int = logging.INFO) -> StructuredLogger:
+    """
+    Get a configured logger instance.
+    
+    Args:
+        name: Logger name (usually __name__)
+        level: Logging level
+    
+    Returns:
+        Configured structured logger instance
+    """
+    logger = logging.getLogger(name)
+    
+    # Only configure if no handlers exist (avoid duplicate logs)
+    if not logger.handlers:
+        logger.setLevel(level)
+        
+        # Console handler with formatting
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(level)
+        
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        console_handler.setFormatter(formatter)
+        
+        logger.addHandler(console_handler)
+    
+    return StructuredLogger(logger)
