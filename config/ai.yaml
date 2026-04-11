@@ -24,8 +24,9 @@ ai:
       model: claude-haiku-3-5-20241022
 
     merge_arbitration:
-      enabled: false    # Phase 4 — not yet implemented
+      enabled: true
       model: claude-3-5-sonnet-20241022  # Needs nuanced judgment
+      batch_size: 100
 
     approval_decisions:
       enabled: false    # Phase 6 — not yet implemented

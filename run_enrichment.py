@@ -28,6 +28,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from workers.discovery_worker import DiscoveryWorker
 from workers.scraping_worker import ScrapingWorker
+from workers.google_discovery_worker import GoogleDiscoveryWorker
+from workers.ai_merge_worker import AIMergeWorker
+from pipeline.mvp_publish_gate import MVPPublishGate
 from config.loader import get_enabled_sources
 from utils.logger import get_logger
 
@@ -158,6 +161,42 @@ async def run_all_workers(args):
         await asyncio.gather(*tasks)
 
 
+async def run_mvp_google_first(args):
+    """Run Google-first MVP orchestration."""
+    logger.info(
+        "Starting mvp_google_first pipeline",
+        batch_size=args.batch_size,
+        dry_run=args.dry_run,
+    )
+    discovery = GoogleDiscoveryWorker(
+        target_states=args.states,
+        batch_size=args.batch_size or 200,
+        dry_run=args.dry_run,
+    )
+    discovery_stats = await discovery.run()
+    logger.info("Google discovery complete", **discovery_stats)
+
+    from scripts.seed_enrichment_requests_from_google import seed_requests
+    seeded = seed_requests(limit=args.limit)
+    logger.info("Seeded layer 3 requests", seeded=seeded)
+
+    # Run one pass of discovery/scraping for both sources.
+    for source in ("justia", "avvo"):
+        worker = DiscoveryWorker(source_key=source, batch_size=args.batch_size or 20)
+        await worker.run_once()
+    for source in ("justia", "avvo"):
+        worker = ScrapingWorker(source_key=source, batch_size=args.batch_size or 10)
+        await worker.run_once()
+
+    merge_worker = AIMergeWorker(batch_size=args.batch_size or 100, dry_run=args.dry_run)
+    merge_stats = await merge_worker.run_once()
+    logger.info("AI merge complete", **merge_stats)
+
+    gate = MVPPublishGate()
+    gate_stats = gate.apply(limit=args.limit, dry_run=args.dry_run)
+    logger.info("Publish gate complete", **gate_stats)
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -168,7 +207,7 @@ def main():
     
     parser.add_argument(
         '--worker',
-        choices=['discovery', 'scraping', 'layer4', 'all'],
+        choices=['discovery', 'scraping', 'layer4', 'all', 'mvp_google_first'],
         required=True,
         help='Which worker to run',
     )
@@ -181,7 +220,7 @@ def main():
     parser.add_argument(
         '--dry-run',
         action='store_true',
-        help='Dry run mode (not yet implemented)',
+        help='Dry run mode',
     )
     
     parser.add_argument(
@@ -208,17 +247,17 @@ def main():
         type=int,
         help='Number of requests per cycle (default varies by worker)',
     )
+    parser.add_argument(
+        '--states',
+        nargs='*',
+        help='Optional state codes for mvp_google_first (e.g. CA NY)',
+    )
     
     args = parser.parse_args()
     
     # Validate source argument
     if args.source and args.worker == 'layer4':
         logger.warning("--source is ignored for layer4 worker")
-    
-    # Dry run not yet implemented
-    if args.dry_run:
-        logger.error("--dry-run mode not yet implemented")
-        sys.exit(1)
     
     # Route to appropriate worker
     try:
@@ -230,6 +269,8 @@ def main():
             asyncio.run(run_layer4_worker(args))
         elif args.worker == 'all':
             asyncio.run(run_all_workers(args))
+        elif args.worker == 'mvp_google_first':
+            asyncio.run(run_mvp_google_first(args))
     except KeyboardInterrupt:
         logger.info("Worker interrupted by user")
         sys.exit(0)

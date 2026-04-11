@@ -7,6 +7,77 @@
 #   - lawyer_enrichment.raw_data_by_source keys
 # ============================================================================
 
+mvp_google_first:
+  enabled: false
+  target_total_profiles: 10000
+  city_tiers:
+    tier1:
+      min_population: 1000000
+      query_count_min: 40
+      query_count_max: 50
+    tier2:
+      min_population: 250000
+      query_count_min: 20
+      query_count_max: 30
+    tier3:
+      min_population: 100000
+      query_count_min: 10
+      query_count_max: 15
+    tier4:
+      min_population: 50000
+      query_count_min: 5
+      query_count_max: 8
+  practice_areas:
+    - Personal Injury
+    - Criminal Defense
+    - Family Law
+    - Immigration
+    - Employment Law
+    - Bankruptcy
+    - Real Estate
+    - Estate Planning
+    - DUI/DWI
+    - Divorce
+    - Workers Compensation
+    - Medical Malpractice
+  states:
+    CA: 1500
+    NY: 1300
+    TX: 1000
+    FL: 900
+    IL: 600
+    PA: 500
+    OH: 450
+    GA: 400
+    NJ: 350
+    NC: 350
+    VA: 250
+    AZ: 250
+    MA: 250
+    MI: 300
+    WA: 250
+    IN: 200
+    MO: 200
+    MD: 200
+    WI: 150
+    CO: 200
+    TN: 200
+    MN: 200
+  google_api:
+    endpoint: "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    page_size: 20
+    max_pages_per_query: 3
+    query_templates:
+      - "{practice_area} lawyer in {city}, {state_code}"
+      - "{practice_area} attorney in {city}, {state_code}"
+  thresholds:
+    min_google_rating: 3.5
+    min_google_review_count: 5
+    min_popularity_score_normalized: 40
+  defaults:
+    per_state_batch_limit: 1000
+    dry_run_limit_profiles: 200
+
 sources:
 
   # ==========================================================================

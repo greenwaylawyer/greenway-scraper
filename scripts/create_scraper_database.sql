@@ -603,6 +603,57 @@ ORDER BY severity DESC, alert_type;
 COMMENT ON VIEW v_enrichment_alerts IS 
     'Automatic alert triggers for monitoring dashboard. Query regularly to check for issues.';
 
+-- Google-first MVP funnel metrics
+CREATE OR REPLACE VIEW v_google_first_discovery_funnel AS
+SELECT
+    COALESCE(license_state, state) AS state_code,
+    COUNT(*) FILTER (
+        WHERE COALESCE((raw_data_by_source ? 'google_discovery'), false)
+    ) AS discovered,
+    COUNT(*) FILTER (
+        WHERE COALESCE((merged_data->>'google_discovery_selected')::boolean, false) = true
+    ) AS selected,
+    COUNT(*) FILTER (
+        WHERE raw_data_by_source ? 'justia'
+           OR raw_data_by_source ? 'avvo'
+    ) AS enriched_layer3,
+    COUNT(*) FILTER (
+        WHERE ready_for_promotion = true
+    ) AS ready_for_promotion,
+    COUNT(*) FILTER (
+        WHERE manual_review_required = true
+    ) AS manual_review_queue
+FROM lawyer_enrichment
+GROUP BY COALESCE(license_state, state)
+ORDER BY discovered DESC;
+
+COMMENT ON VIEW v_google_first_discovery_funnel IS
+    'Google-first discovery -> selection -> enrichment -> publish funnel metrics by state.';
+
+CREATE OR REPLACE VIEW v_google_first_quality_metrics AS
+SELECT
+    ROUND(
+        100.0 * COUNT(*) FILTER (
+            WHERE COALESCE((merged_data->>'google_discovery_selected')::boolean, false) = true
+        ) / NULLIF(COUNT(*) FILTER (WHERE raw_data_by_source ? 'google_discovery'), 0),
+        2
+    ) AS selection_rate_pct,
+    ROUND(
+        100.0 * COUNT(*) FILTER (
+            WHERE ready_for_promotion = true
+        ) / NULLIF(COUNT(*) FILTER (
+            WHERE COALESCE((merged_data->>'google_discovery_selected')::boolean, false) = true
+        ), 0),
+        2
+    ) AS publish_pass_rate_pct,
+    ROUND(AVG(completeness_score), 2) AS avg_completeness,
+    ROUND(AVG(google_rating)::numeric, 2) AS avg_google_rating
+FROM lawyer_enrichment
+WHERE COALESCE((merged_data->>'google_discovery_selected')::boolean, false) = true;
+
+COMMENT ON VIEW v_google_first_quality_metrics IS
+    'Aggregate quality metrics for Google-first selected profiles.';
+
 -- ============================================================================
 -- Views for monitoring
 -- ============================================================================

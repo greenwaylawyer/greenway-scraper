@@ -16,7 +16,7 @@ from normalizers.address import AddressNormalizer
 from normalizers.phone import PhoneNormalizer
 from normalizers.practice_areas import PracticeAreaNormalizer
 from normalizers.name import NameNormalizer
-from pipeline.dedup import FingerprintGenerator
+from pipeline.dedup import FingerprintGenerator, normalize_bar_number
 from pipeline.scorer import CompletenessScorer
 from utils.logger import get_logger
 
@@ -67,8 +67,8 @@ class DataExporter:
 
         output_path = self.output_dir / filename
 
-        # Convert to normalized format
-        normalized = [self._normalize_lawyer(lawyer) for lawyer in lawyers]
+        # Convert to normalized format (includes bar_number dedupe per state)
+        normalized = self.normalize_for_db(lawyers)
 
         # Write to file
         with open(output_path, 'w') as f:
@@ -107,7 +107,7 @@ class DataExporter:
             record = self._normalize_lawyer(lawyer)
             normalized.append(record)
 
-        return normalized
+        return self._dedupe_records_by_bar_and_state(normalized)
 
     def export_to_database(self, lawyers: list[LawyerRawData], layer_name: str = "state_bars", enrichment_level: int = 1) -> int:
         """
@@ -183,6 +183,9 @@ class DataExporter:
             logger.error("Database connection failed", error=str(e))
             raise
 
+        # Normalize + dedupe before batch metadata and inserts
+        normalized = self.normalize_for_db(lawyers)
+
         # Create or update enrichment batch record
         # Check if batch already exists (created by BatchTracker)
         cursor.execute("SELECT batch_id FROM enrichment_batches WHERE batch_id = %s", (str(self.batch_id),))
@@ -196,7 +199,7 @@ class DataExporter:
                     updated_at = NOW()
                 WHERE batch_id = %s
             """
-            cursor.execute(update_batch_query, (len(lawyers), str(self.batch_id)))
+            cursor.execute(update_batch_query, (len(normalized), str(self.batch_id)))
             logger.info("Updated existing batch record", batch_id=str(self.batch_id))
         else:
             # Create new batch record (backwards compatibility)
@@ -209,15 +212,12 @@ class DataExporter:
                 str(self.batch_id),
                 layer_name,
                 self.state.upper(),
-                len(lawyers),
+                len(normalized),
                 'running'
             ))
             logger.info("Created new batch record", batch_id=str(self.batch_id))
 
         conn.commit()
-
-        # Normalize lawyer data
-        normalized = self.normalize_for_db(lawyers)
 
         # Prepare UPSERT statement for lawyer_enrichment table
         # Build dynamic level completion field name
@@ -491,6 +491,54 @@ class DataExporter:
 
         return inserted + updated
 
+    @staticmethod
+    def _canonical_bar_for_storage(raw: Optional[str]) -> Optional[str]:
+        """Strip noise (#, extra spaces) for stored bar_number; fingerprint uses normalize_bar_number."""
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        if s.startswith("#"):
+            s = s[1:].strip()
+        s = " ".join(s.split())
+        return s or None
+
+    @staticmethod
+    def _dedupe_records_by_bar_and_state(records: list[dict]) -> list[dict]:
+        """
+        One row per (bar_number, license_state) when bar_number is present.
+        Keeps the record with the highest completeness_score (ties: later wins).
+        """
+        best: dict[tuple[str, str], dict] = {}
+        no_bar: list[dict] = []
+
+        for r in records:
+            bar = normalize_bar_number(r.get("bar_number"))
+            state = (r.get("license_state") or "").strip().upper()
+            if not bar:
+                no_bar.append(r)
+                continue
+            key = (bar, state)
+            prev = best.get(key)
+            if prev is None:
+                best[key] = r
+            else:
+                s_new = r.get("completeness_score") or 0
+                s_old = prev.get("completeness_score") or 0
+                if s_new > s_old:
+                    best[key] = r
+
+        deduped = list(best.values()) + no_bar
+        removed = len(records) - len(deduped)
+        if removed > 0:
+            logger.info(
+                "Deduped records before DB export",
+                removed=removed,
+                kept=len(deduped),
+            )
+        return deduped
+
     def _normalize_lawyer(self, lawyer: LawyerRawData) -> dict:
         """Normalize a single lawyer record."""
 
@@ -514,7 +562,7 @@ class DataExporter:
         except Exception:
             practice_areas_normalized = PracticeAreaNormalizer.normalize(lawyer.practice_areas)
 
-        # Generate fingerprint
+        # Generate fingerprint (uses normalized bar + state; see pipeline.dedup)
         fingerprint = FingerprintGenerator.generate(lawyer, self.state)
 
         # Calculate completeness score
@@ -556,7 +604,7 @@ class DataExporter:
                 lawyer.middle_name                      # use field value if scraper provided it
                 or name_data.get('middle_name')         # fall back to what NameNormalizer parsed
             ),
-            'bar_number': lawyer.bar_number,
+            'bar_number': self._canonical_bar_for_storage(lawyer.bar_number),
             'license_state': self.state.upper(),
             'license_status': lawyer.license_status,
             'admission_date': f"{lawyer.admission_year}-01-01" if lawyer.admission_year else None,

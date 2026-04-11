@@ -26,6 +26,18 @@ def load_enrichment_sources() -> Dict[str, Any]:
     return config.get('sources', {})
 
 
+def load_full_config() -> Dict[str, Any]:
+    """Load the full enrichment YAML config."""
+    config_file = get_config_path() / 'enrichment_sources.yaml'
+    with open(config_file, 'r') as f:
+        return yaml.safe_load(f) or {}
+
+
+def get_mvp_google_first_config() -> Dict[str, Any]:
+    """Get top-level Google-first MVP configuration."""
+    return load_full_config().get("mvp_google_first", {})
+
+
 def get_source_config(source_key: str) -> Optional[Dict[str, Any]]:
     """
     Get configuration for a specific source.
