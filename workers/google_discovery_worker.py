@@ -82,10 +82,10 @@ class GoogleDiscoveryWorker:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
                     """
-                    SELECT c.name, c.population, s.code AS state_code
+                    SELECT c.name, c.population, s.abbreviation AS state_code
                     FROM cities c
                     JOIN states s ON s.id = c.state_id
-                    WHERE s.code = %s
+                    WHERE s.abbreviation = %s
                       AND c.population IS NOT NULL
                       AND c.population >= %s
                     ORDER BY c.population DESC, c.name ASC
