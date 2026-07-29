@@ -29,8 +29,6 @@ services:
       - LOG_LEVEL=info
       - LOG_HTML=false
       - CAPTCHA_SOLVER=none
-    ports:
-      - "8191:8191"    # accessible from host at http://localhost:8191
     networks:
       - greenway_network
 

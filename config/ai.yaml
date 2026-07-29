@@ -9,28 +9,30 @@ ai:
   enabled: false
 
   # Primary provider
-  provider: anthropic
-  model: claude-haiku-3-5-20241022   # Cheap, fast — correct for batch enrichment
+  #   gemini     -> Google Gemini via google-genai SDK (default; cost-effective)
+  #   anthropic  -> Anthropic Claude via anthropic SDK
+  provider: gemini
+  model: gemini-2.5-flash   # Cheap, fast — correct for batch enrichment
 
   # Per-feature toggles (only active when master enabled: true)
   features:
     practice_area_normalization:
       enabled: true
-      model: claude-haiku-3-5-20241022   # Haiku sufficient for classification
+      model: gemini-2.5-flash   # Flash sufficient for classification
       batch_size: 50                      # Terms per API call
 
     data_quality_scoring:
       enabled: false    # Phase 3 — not yet implemented
-      model: claude-haiku-3-5-20241022
+      model: gemini-2.5-flash
 
     merge_arbitration:
       enabled: true
-      model: claude-3-5-sonnet-20241022  # Needs nuanced judgment
+      model: gemini-2.5-flash  # Flash handles merge arbitration well; bump to gemini-2.5-pro if quality drops
       batch_size: 100
 
     approval_decisions:
       enabled: false    # Phase 6 — not yet implemented
-      model: claude-3-5-sonnet-20241022
+      model: gemini-2.5-flash
 
   # Response cache (SQLite) — avoids re-calling AI for identical inputs
   cache:

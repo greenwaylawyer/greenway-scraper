@@ -47,9 +47,8 @@ class AIPracticeAreaNormalizer:
 
     def _get_client(self):
         if self._client is None:
-            from ai.providers.anthropic import AnthropicClient
-            model = ai_config.feature_model(_FEATURE)
-            self._client = AnthropicClient(model=model)
+            from ai.providers.factory import get_client
+            self._client = get_client(_FEATURE)
         return self._client
 
     def normalize(self, raw_areas: Optional[list]) -> Set[str]:

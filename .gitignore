@@ -50,6 +50,10 @@ checkpoints/
 *.log
 logs/
 
+# Large data files
+sample-webpage-data/data.ny.gov/
+*.csv
+
 # Pytest / coverage
 .pytest_cache/
 .coverage

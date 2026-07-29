@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ai import config as ai_config
-from ai.providers.anthropic import AnthropicClient
+from ai.providers.factory import get_client
 from pipeline.merge_engine import MergeEngine
 from utils.logger import get_logger
 
@@ -32,7 +32,7 @@ class AIMergeWorker:
         self.dry_run = dry_run
         self.stats = {"checked": 0, "merged": 0, "fallback_merged": 0, "errors": 0}
         self._merge_engine = MergeEngine()
-        self._client: Optional[AnthropicClient] = None
+        self._client: Optional[Any] = None
 
     def _conn(self):
         return psycopg2.connect(
@@ -43,12 +43,12 @@ class AIMergeWorker:
             password=os.getenv("SCRAPER_DB_PASSWORD", "scraper_secret"),
         )
 
-    def _client_or_none(self) -> Optional[AnthropicClient]:
+    def _client_or_none(self) -> Optional[Any]:
         if not ai_config.is_feature_enabled("merge_arbitration"):
             return None
         if self._client is None:
             try:
-                self._client = AnthropicClient(model=ai_config.feature_model("merge_arbitration"))
+                self._client = get_client("merge_arbitration")
             except Exception as exc:
                 # Gracefully degrade to deterministic merge if AI client is unavailable.
                 logger.warning("AI merge client unavailable; using deterministic merge only", error=str(exc))
