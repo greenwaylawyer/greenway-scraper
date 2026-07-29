@@ -34,6 +34,7 @@ class GoogleDiscoveryWorker:
         target_states: Optional[List[str]] = None,
         batch_size: int = 200,
         dry_run: bool = False,
+        limit: Optional[int] = None,
     ):
         self.config = get_mvp_google_first_config()
         if not self.config:
@@ -42,6 +43,9 @@ class GoogleDiscoveryWorker:
         self.target_states = [s.upper() for s in (target_states or list(self.config.get("states", {}).keys()))]
         self.batch_size = batch_size
         self.dry_run = dry_run
+        # Optional hard cap on the number of profiles persisted (after ranking).
+        # The highest-popularity profiles are kept; lower-ranked ones are dropped.
+        self.limit = limit
         self.api_key = os.getenv("GOOGLE_PLACES_API_KEY")
         self.rate_limiter = TokenBucketRateLimiter(rate=40)
         self.cost_protection = CostProtectionSystem()
@@ -165,6 +169,15 @@ class GoogleDiscoveryWorker:
         cities = self._fetch_cities(state_code)
         all_candidates: List[Dict[str, Any]] = []
 
+        # Early-stop ceiling: when --limit is set, gather only enough raw
+        # candidates to realistically yield `limit` qualified individuals.
+        # Raw candidates include firms/low-rated noise (only ~1 in 4 passes the
+        # individual + threshold filters), so we target ~4x the limit.
+        if self.limit is not None and self.limit >= 0:
+            early_stop_ceiling = max(self.limit * 4, 40)
+        else:
+            early_stop_ceiling = max(state_quota * 4, 500)
+
         async with aiohttp.ClientSession() as session:
             for city in cities:
                 city_name = city["name"]
@@ -189,9 +202,9 @@ class GoogleDiscoveryWorker:
                                 "source": "google_discovery",
                             }
                         )
-                    if len(all_candidates) >= max(state_quota * 4, 500):
+                    if len(all_candidates) >= early_stop_ceiling:
                         break
-                if len(all_candidates) >= max(state_quota * 4, 500):
+                if len(all_candidates) >= early_stop_ceiling:
                     break
         return all_candidates
 
@@ -307,6 +320,10 @@ class GoogleDiscoveryWorker:
             min_review_count=int(self.config["thresholds"]["min_google_review_count"]),
             min_popularity_score=float(self.config["thresholds"]["min_popularity_score_normalized"]),
         )
+        # Apply an optional hard cap. `selected` is already ranked by
+        # popularity_score descending, so slicing keeps the best-reviewed first.
+        if self.limit is not None and self.limit >= 0:
+            selected = selected[: self.limit]
         self.stats["selected_profiles"] = len(selected)
         self.stats["persisted_profiles"] = self._persist_selected(selected)
         return self.stats
@@ -319,12 +336,19 @@ async def main():
     parser.add_argument("--states", nargs="*", help="State codes (e.g. CA NY TX)")
     parser.add_argument("--batch-size", type=int, default=200)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Hard cap on persisted profiles. Keeps the highest-popularity (best-reviewed) first.",
+    )
     args = parser.parse_args()
 
     worker = GoogleDiscoveryWorker(
         target_states=args.states,
         batch_size=args.batch_size,
         dry_run=args.dry_run,
+        limit=args.limit,
     )
     stats = await worker.run()
     logger.info("Google discovery complete", **stats)

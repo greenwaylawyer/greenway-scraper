@@ -27,19 +27,10 @@ mvp_google_first:
       min_population: 50000
       query_count_min: 5
       query_count_max: 8
+  # Practice areas to search. Add more (e.g. Criminal Defense, Family Law) to
+  # broaden discovery beyond immigration.
   practice_areas:
-    - Personal Injury
-    - Criminal Defense
-    - Family Law
     - Immigration
-    - Employment Law
-    - Bankruptcy
-    - Real Estate
-    - Estate Planning
-    - DUI/DWI
-    - Divorce
-    - Workers Compensation
-    - Medical Malpractice
   states:
     CA: 1500
     NY: 1300

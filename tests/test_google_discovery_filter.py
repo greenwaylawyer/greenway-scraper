@@ -66,3 +66,43 @@ def test_dedupe_and_rank_by_state_quota():
     assert len(selected) == 1
     assert selected[0]["google_discovery_rank"] == 1
     assert selected[0]["google_discovery_selected"] is True
+
+
+def test_ranking_keeps_best_reviewed_first_for_limit():
+    """
+    The worker's --limit relies on `selected` being sorted by popularity_score
+    descending, so slicing keeps the best-reviewed profiles. This test pins
+    that ordering invariant.
+    """
+    rows = [
+        {
+            "name": "Top Rated",
+            "city": "New York",
+            "state": "NY",
+            "google_rating": 4.9,
+            "google_review_count": 500,
+        },
+        {
+            "name": "Mid Reviewed",
+            "city": "New York",
+            "state": "NY",
+            "google_rating": 4.3,
+            "google_review_count": 60,
+        },
+        {
+            "name": "Lower Reviewed",
+            "city": "Buffalo",
+            "state": "NY",
+            "google_rating": 3.8,
+            "google_review_count": 20,
+        },
+    ]
+    selected = dedupe_and_rank(rows, state_quotas={"NY": 10})
+    assert len(selected) == 3
+    # Ordered by popularity_score descending
+    scores = [r["google_popularity_score"] for r in selected]
+    assert scores == sorted(scores, reverse=True)
+
+    # Simulating the worker's `selected[:limit]` for --limit 1 must keep the top.
+    limited = selected[:1]
+    assert limited[0]["name"] == "Top Rated"
