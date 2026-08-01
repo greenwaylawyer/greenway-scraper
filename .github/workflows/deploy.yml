@@ -1,15 +1,18 @@
 name: Deploy Scraper
+
 on:
   push:
     branches: [main]
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.DO_DROPLET_HOST }}
-          username: ${{ secrets.DO_DROPLET_USER }}
+          host: 157.230.8.163
+          username: root
           key: ${{ secrets.DO_DROPLET_SSH_KEY }}
-          port: ${{ secrets.DO_DROPLET_PORT }}
-          script: /home/jobaer/greenway-scraper/deploy.sh
+          port: 22
+          script: |
+            su - jobaer -c 'cd /home/jobaer/greenway-scraper && bash deploy.sh'
