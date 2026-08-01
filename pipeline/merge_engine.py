@@ -15,6 +15,29 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def normalize_name_split(scraped_data: Dict[str, Any]) -> None:
+    """
+    Ensure first_name/last_name/full_name are consistent.
+
+    If a source emits only full_name, split it (on the last space) into
+    first_name/last_name. If it emits only first/last, compose full_name.
+    Mutates `scraped_data` in place. Skips single-token names where a split
+    would be ambiguous (keeps full_name only).
+    """
+    full = (scraped_data.get("full_name") or "").strip()
+    first = (scraped_data.get("first_name") or "").strip()
+    last = (scraped_data.get("last_name") or "").strip()
+
+    if not first and not last and full:
+        parts = full.split()
+        if len(parts) >= 2:
+            scraped_data["first_name"] = " ".join(parts[:-1])
+            scraped_data["last_name"] = parts[-1]
+    elif not full and (first or last):
+        scraped_data["full_name"] = " ".join([x for x in (first, last) if x])
+
+
+
 # Identity fields protected by Rule 2
 IDENTITY_FIELDS = {
     'full_name',
@@ -93,6 +116,9 @@ class MergeEngine:
         if '_needs_review' not in updated_data:
             updated_data['_needs_review'] = []
 
+        # Normalize identity name fields so first/last/full stay consistent.
+        normalize_name_split(scraped_data)
+
         for field, value in scraped_data.items():
             # Skip empty/None values
             if value is None or value == '' or (isinstance(value, list) and len(value) == 0):
@@ -104,8 +130,19 @@ class MergeEngine:
                 self.fields_skipped.append(f"{field} (curated)")
                 continue
 
-            # RULE 2: Protect identity fields (Layers 1-2 only can write)
+            # RULE 2: Protect identity fields (Layers 1-2 only can write).
+            # EXCEPTION (fill-if-empty): a Layer >= 3 source may populate an
+            # identity field ONCE when the profile has no real value yet — e.g.
+            # Manual Scraper rows seeded with an admin title instead of a name.
+            # Once written, normal identity protection resumes on later merges.
             if field in IDENTITY_FIELDS and layer >= 3:
+                existing = updated_data.get(field)
+                if existing is None or existing == '':
+                    updated_data[field] = value
+                    updated_data['_field_sources'][field] = source_key
+                    self.fields_merged.append(field)
+                    logger.debug(f"Identity fill-if-empty: {field} from {source_key}")
+                    continue
                 logger.debug(f"Skipping identity field from Layer {layer}: {field}")
                 self.fields_skipped.append(f"{field} (identity)")
                 continue

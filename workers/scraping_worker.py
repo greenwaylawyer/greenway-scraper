@@ -244,6 +244,16 @@ class ScrapingWorker:
                 source_key=source_key,
                 layer=request['layer'],
             )
+
+            # Sync resolved identity/location from merged_data into the
+            # top-level lawyer_enrichment columns (full_name, first_name, etc.)
+            # so the Curate page, list views, and promotion see them without
+            # having to read merged_data. Only fills when present + not already
+            # set on the column (fill-if-empty semantics).
+            await self._sync_identity_columns(
+                request['lawyer_enrichment_id'],
+                merge_result['merged_data'],
+            )
             
             self.stats['completed'] += 1
             logger.info(
@@ -364,6 +374,50 @@ class ScrapingWorker:
                 )
 
                 conn.commit()
+        finally:
+            conn.close()
+
+    async def _sync_identity_columns(self, lawyer_enrichment_id: int, merged_data: Dict[str, Any]) -> None:
+        """
+        Backfill top-level lawyer_enrichment identity/location columns from
+        merged_data, fill-if-empty only (COALESCE keeps any existing value).
+
+        The scraper writes enrichment fields into merged_data; these top-level
+        columns are what the Curate page, lawyer list, and promotion job read.
+        Address fields are read from merged_data['address'][...] when present.
+        """
+        if not merged_data:
+            return
+
+        address = merged_data.get('address') or {}
+        values = {
+            'full_name': merged_data.get('full_name'),
+            'first_name': merged_data.get('first_name'),
+            'last_name': merged_data.get('last_name'),
+            'firm_name': merged_data.get('firm_name'),
+            'city': address.get('city') or merged_data.get('city'),
+            'state': address.get('state') or merged_data.get('state'),
+        }
+        # Drop empties; only fill columns that have a value to set.
+        values = {k: v for k, v in values.items() if v not in (None, '')}
+        if not values:
+            return
+
+        set_clause = ", ".join(f"{col} = COALESCE(NULLIF(%s, ''), {col})" for col in values)
+        params = list(values.values()) + [lawyer_enrichment_id]
+
+        conn = self._get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE lawyer_enrichment
+                    SET {set_clause}, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    params,
+                )
+            conn.commit()
         finally:
             conn.close()
 
