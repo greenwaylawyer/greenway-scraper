@@ -236,6 +236,13 @@ class ScrapingWorker:
                 self.stats['no_data'] += 1
                 logger.warning(f"No data found at {url} for request {request_id}")
                 return True
+
+            if set(scraped_data.keys()) == {'source_profile_url'}:
+                # Scraper returned only the URL — no profile data extracted
+                await self._update_request_no_data(request_id)
+                self.stats['no_data'] += 1
+                logger.warning(f"Only source_profile_url from {url} — treating as no_data")
+                return True
             
             # Merge into lawyer_enrichment.
             # Re-read merged_data from DB to avoid stale data from a batch fetch

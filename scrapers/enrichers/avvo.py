@@ -601,4 +601,4 @@ class AvvoEnricher(BaseEnricher):
         except Exception:
             pass
 
-        return cleaned or None
+        return cleaned if len(cleaned) > 1 or 'source_profile_url' not in cleaned else None
