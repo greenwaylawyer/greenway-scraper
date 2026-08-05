@@ -332,6 +332,7 @@ class GooglePlacesEnricher(BaseEnricher):
                     # Build structured data
                     profile_data = {
                         'place_id': place_id,
+                        'name': result.get('name'),
                         'google_rating': result.get('rating'),
                         'google_review_count': result.get('user_ratings_total'),
                         'google_reviews': reviews,

@@ -81,6 +81,20 @@ class ScrapingWorker:
             password=os.getenv('SCRAPER_DB_PASSWORD', 'scraper_secret'),
         )
 
+    def _fetch_current_merged_data(self, lawyer_enrichment_id: int) -> Dict[str, Any]:
+        """Re-read merged_data from DB immediately before merge to avoid stale batch data."""
+        conn = self._get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    "SELECT merged_data FROM lawyer_enrichment WHERE id = %s",
+                    (lawyer_enrichment_id,),
+                )
+                row = cursor.fetchone()
+                return row['merged_data'] if row and row['merged_data'] else {}
+        finally:
+            conn.close()
+
     def get_enricher(self, source_key: str) -> Optional[BaseEnricher]:
         """Get or create enricher instance for a source."""
         if source_key in self.enrichers:
@@ -223,10 +237,15 @@ class ScrapingWorker:
                 logger.warning(f"No data found at {url} for request {request_id}")
                 return True
             
-            # Merge into lawyer_enrichment
+            # Merge into lawyer_enrichment.
+            # Re-read merged_data from DB to avoid stale data from a batch fetch
+            # where another request for the same profile was processed earlier in
+            # this poll cycle.
+            fresh_merged = self._fetch_current_merged_data(request['lawyer_enrichment_id'])
+
             merge_result = merge_scraped_data(
                 lawyer_enrichment={
-                    'merged_data': request.get('merged_data', {}),
+                    'merged_data': fresh_merged,
                     'manually_curated_fields': request.get('manually_curated_fields', []),
                 },
                 scraped_data=scraped_data,
@@ -395,6 +414,10 @@ class ScrapingWorker:
             'first_name': merged_data.get('first_name'),
             'last_name': merged_data.get('last_name'),
             'firm_name': merged_data.get('firm_name'),
+            'bar_number': merged_data.get('bar_number'),
+            'license_state': merged_data.get('license_state') or address.get('state') or merged_data.get('state'),
+            'license_status': merged_data.get('license_status'),
+            'admission_date': merged_data.get('admission_date'),
             'city': address.get('city') or merged_data.get('city'),
             'state': address.get('state') or merged_data.get('state'),
         }

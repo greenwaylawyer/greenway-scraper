@@ -336,6 +336,8 @@ class AvvoEnricher(BaseEnricher):
         # ── 1. JSON-LD (primary source for structured data) ───────────────────
         ld = self._extract_jsonld(soup, "LocalBusiness")
 
+        # Extract identity from JSON-LD (name, phone, address, photo, social)
+        full_name   = self._clean(ld.get("name", "")) or None
         bio         = self._clean(ld.get("description", "")) or None
         photo_url   = None
         if isinstance(ld.get("image"), dict):
@@ -376,7 +378,46 @@ class AvvoEnricher(BaseEnricher):
         }
         address = {k: v for k, v in address.items() if v}
 
-        # ── 2. Bio from HTML (JSON-LD may be truncated) ───────────────────────
+        # ── 2. License / bar info from the profile header ──────────────────────
+        license_state = None
+        license_status = None
+        bar_number = None
+        law_school = None
+        admission_year = None
+
+        # The license section typically has: "Licensed for X years · State: NY · Status: Active"
+        license_section = soup.select_one(
+            ".license-info, .license-status, .profile-license-summary, "
+            ".license-section, .bar-admission-info"
+        )
+        if license_section:
+            license_text = self._clean(license_section.get_text(" "))
+            for part in re.split(r'\s*[·•|]\s*', license_text):
+                part_lower = part.lower()
+                if 'state' in part_lower:
+                    m = re.search(r'state\s*:?\s*(.+)', part, re.I)
+                    if m:
+                        license_state = self._clean(m.group(1))
+                elif 'status' in part_lower:
+                    m = re.search(r'status\s*:?\s*(.+)', part, re.I)
+                    if m:
+                        license_status = self._clean(m.group(1))
+                elif 'licensed' in part_lower:
+                    m = re.search(r'(\d{4})', part)
+                    if m:
+                        admission_year = m.group(1)
+                elif 'bar' in part_lower and '#' in part:
+                    m = re.search(r'#\s*(\d+)', part)
+                    if m:
+                        bar_number = m.group(1)
+
+        # Fallback: try structured json-ld alternative
+        if not bar_number:
+            alt_ld = self._extract_jsonld(soup, "Attorney")
+            if alt_ld:
+                bar_number = alt_ld.get("barNumber") or alt_ld.get("identifier")
+
+        # ── 3. Bio from HTML (JSON-LD may be truncated) ───────────────────────
         bio_html_el = soup.select_one(
             ".about-container .show-less-bio, "
             ".about-container #bio-content, "
@@ -387,7 +428,7 @@ class AvvoEnricher(BaseEnricher):
             if bio_html and (not bio or len(bio_html) > len(bio)):
                 bio = bio_html
 
-        # ── 3. Practice areas from HTML (more reliable on the profile page) ──
+        # ── 4. Practice areas from HTML (more reliable on the profile page) ──
         if not practice_areas:
             pa_section = soup.select_one(".practice-area-and-fees-section")
             if pa_section:
@@ -397,7 +438,7 @@ class AvvoEnricher(BaseEnricher):
                         practice_areas.append(t)
                 practice_areas = list(dict.fromkeys(practice_areas))
 
-        # ── 4. Ratings ────────────────────────────────────────────────────────
+        # ── 5. Ratings ────────────────────────────────────────────────────────
         client_rating   = None
         client_reviews  = None
         avvo_rating     = None
@@ -424,7 +465,7 @@ class AvvoEnricher(BaseEnricher):
                 except ValueError:
                     pass
 
-        # ── 5. Education ──────────────────────────────────────────────────────
+        # ── 6. Education ──────────────────────────────────────────────────────
         education_history: List[Dict[str, Any]] = []
         edu_sec = soup.select_one(".education-container")
         if edu_sec:
@@ -443,7 +484,7 @@ class AvvoEnricher(BaseEnricher):
                 if entry:
                     education_history.append(entry)
 
-        # ── 6. Work experience ────────────────────────────────────────────────
+        # ── 7. Work experience ────────────────────────────────────────────────
         work_history: List[Dict[str, Any]] = []
         work_sec = soup.select_one(".work-experience-container")
         if work_sec:
@@ -473,13 +514,13 @@ class AvvoEnricher(BaseEnricher):
                 if entry:
                     work_history.append(entry)
 
-        # ── 7. Professional associations ──────────────────────────────────────
+        # ── 8. Professional associations ──────────────────────────────────────
         associations: List[Dict[str, Any]] = []
         assoc_sec = soup.select_one(".associations-container")
         if assoc_sec:
             associations = self._parse_experience_section(assoc_sec)
 
-        # ── 8. Languages ──────────────────────────────────────────────────────
+        # ── 9. Languages ──────────────────────────────────────────────────────
         languages: List[str] = []
         lang_sec = soup.select_one(".languages-container")
         if lang_sec:
@@ -488,13 +529,13 @@ class AvvoEnricher(BaseEnricher):
                 if t:
                     languages.append(t)
 
-        # ── 9. Publications ───────────────────────────────────────────────────
+        # ── 10. Publications ──────────────────────────────────────────────────
         publications: List[Dict[str, Any]] = []
         pub_sec = soup.select_one(".publications-container")
         if pub_sec:
             publications = self._parse_experience_section(pub_sec)
 
-        # ── 10. Websites (external links not in known social domains) ─────────
+        # ── 11. Websites (external links not in known social domains) ─────────
         SOCIAL_DOMAINS = {"facebook.com", "twitter.com", "x.com", "linkedin.com",
                           "instagram.com", "avvo.com", "justia.com"}
         websites: List[str] = []
@@ -512,11 +553,16 @@ class AvvoEnricher(BaseEnricher):
 
         # ── Assemble result ───────────────────────────────────────────────────
         result: Dict[str, Any] = {
+            "full_name":            full_name,
             "bio":                  bio,
             "practice_areas":       practice_areas,
             "photo_url":            photo_url,
             "phone":                phone or None,
             "address":              address or None,
+            "bar_number":           bar_number,
+            "license_state":        license_state,
+            "license_status":       license_status,
+            "admission_date":       admission_year,
             "avvo_rating":          avvo_rating,
             "client_rating":        client_rating,
             "client_review_count":  client_reviews,
