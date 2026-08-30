@@ -65,6 +65,9 @@ class ApifyBulkWorker:
         self.limit = limit
         self.states = [s.lower() for s in (states or [])]
         self.source_key = "avvo"
+        self.worker_name = "apify_avvo"
+        self._batch_id: Optional[str] = None
+        self._on_apify_status: Optional[Any] = None
         self.client = ApifyClient()
         self.stats = {
             "selected": 0,
@@ -86,6 +89,43 @@ class ApifyBulkWorker:
             password=os.getenv("SCRAPER_DB_PASSWORD", "scraper_secret"),
         )
 
+    def _ensure_heartbeat_table(self):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS worker_heartbeats (
+                        worker_name TEXT PRIMARY KEY,
+                        status TEXT,
+                        detail JSONB,
+                        last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _heartbeat(self, status: str, detail: Optional[Dict[str, Any]] = None):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO worker_heartbeats (worker_name, status, detail, last_heartbeat_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (worker_name) DO UPDATE SET
+                        status = EXCLUDED.status,
+                        detail = EXCLUDED.detail,
+                        last_heartbeat_at = NOW()
+                    """,
+                    (self.worker_name, status, Json(detail or {})),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
     def _config(self) -> Dict[str, Any]:
         return get_source_config(self.source_key) or {}
 
@@ -101,14 +141,26 @@ class ApifyBulkWorker:
         input_data.update(extra)
         return input_data
 
-    async def _run_actor(self, input_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def _run_actor(
+        self,
+        input_data: Dict[str, Any],
+        on_status: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         actor_id = self._actor_id()
         if not actor_id:
             raise ApifyError("No Apify actor_id configured for apify_avvo")
         timeout = self._config().get("apify", {}).get("timeout_seconds", 1800)
         run_id = await self.client.run_actor(actor_id, input_data)
         logger.info("Apify Avvo run started", run_id=run_id, mode=self.mode)
-        status = await self.client.wait_for_finish(run_id, poll_seconds=5, timeout_seconds=timeout)
+
+        async def _report(status: str) -> None:
+            callback = on_status or self._on_apify_status
+            if callback is not None:
+                await callback(status)
+
+        status = await self.client.wait_for_finish(
+            run_id, poll_seconds=5, timeout_seconds=timeout, on_status=_report
+        )
         if status != "SUCCEEDED":
             raise ApifyError(f"Apify Avvo run {run_id} ended with status {status}")
         items = await self._collect_all_items(run_id)
@@ -510,14 +562,23 @@ class ApifyBulkWorker:
         if not updates:
             return
 
-        set_clause = ", ".join(f"{k} = %s" for k in updates)
-        params = [Json(updates[k]) if k == "metadata" else updates[k] for k in updates]
+        metadata = updates.pop("metadata", None)
+        set_parts = [f"{k} = %s" for k in updates]
+        params: List[Any] = list(updates.values())
+        if metadata is not None:
+            set_parts.append("metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb")
+            params.append(Json(metadata))
+        if not set_parts:
+            return
+
+        set_clause = ", ".join(set_parts)
+        params.append(batch_id)
         conn = self._conn()
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
                     f"UPDATE enrichment_batches SET {set_clause}, updated_at = NOW() WHERE batch_id = %s",
-                    (*params, batch_id),
+                    params,
                 )
             conn.commit()
         finally:
@@ -525,16 +586,27 @@ class ApifyBulkWorker:
 
     async def process_batch(self, batch: Dict[str, Any]):
         batch_id = batch["batch_id"]
+        self._batch_id = batch_id
         config = batch.get("config_snapshot") or {}
         self.mode = config.get("mode", "enrich")
         self.limit = config.get("limit")
         self.states = [s.lower() for s in (config.get("states") or [])]
 
+        async def on_apify_status(status: str) -> None:
+            self._heartbeat("running", {"batch_id": batch_id, "apify_status": status})
+            self._update_batch(
+                batch_id,
+                metadata={"apify_run": {"state": "in_progress", "apify_status": status}},
+            )
+
+        self._on_apify_status = on_apify_status
+
         self._update_batch(
             batch_id,
             total_records=self.limit or 0,
-            metadata=batch.get("metadata") or {},
+            metadata={"apify_run": {"state": "in_progress"}},
         )
+        self._heartbeat("running", {"batch_id": batch_id, "phase": "started"})
         try:
             await self.run()
             self._update_batch(
@@ -547,8 +619,9 @@ class ApifyBulkWorker:
                 records_failed=self.stats["errors"],
                 progress_percent=100,
                 completed_at=datetime.now(),
-                metadata={"apify_run": {"state": "done"}, "stats": self.stats},
+                metadata={"apify_run": {"state": "done", "apify_status": "SUCCEEDED"}, "stats": self.stats},
             )
+            self._heartbeat("idle", {"last_batch": batch_id, "result": "completed"})
         except Exception as exc:
             logger.error("Apify Avvo batch failed", batch_id=batch_id, error=str(exc))
             self._update_batch(
@@ -559,8 +632,13 @@ class ApifyBulkWorker:
                 completed_at=datetime.now(),
                 metadata={"apify_run": {"state": "failed"}, "stats": self.stats},
             )
+            self._heartbeat("error", {"last_batch": batch_id, "error": str(exc)})
+        finally:
+            self._on_apify_status = None
+            self._batch_id = None
 
     async def run_batch_loop(self, poll_interval: int = 20):
+        self._ensure_heartbeat_table()
         logger.info("Apify Avvo batch poller started", poll_interval=poll_interval)
         while True:
             try:
@@ -568,8 +646,11 @@ class ApifyBulkWorker:
                 if batch:
                     logger.info("Claimed Apify Avvo batch", batch_id=batch["batch_id"])
                     await self.process_batch(batch)
+                else:
+                    self._heartbeat("idle")
             except Exception as exc:
                 logger.error("Apify Avvo batch loop error", error=str(exc), exc_info=True)
+                self._heartbeat("error", {"error": str(exc)})
             await asyncio.sleep(poll_interval)
 
 

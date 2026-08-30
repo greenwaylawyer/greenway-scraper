@@ -22,8 +22,12 @@
 # Database connection (adjust if needed)
 DB_HOST="${SCRAPER_DB_HOST:-127.0.0.1}"
 DB_PORT="${SCRAPER_DB_PORT:-5433}"
-DB_NAME="${SCRAPER_DB_DATABASE:-greenway_scraper}"
-DB_USER="${SCRAPER_DB_USERNAME:-scraper}"
+DB_NAME="${SCRAPER_DB_NAME:-${SCRAPER_DB_DATABASE:-greenway_scraper}}"
+DB_USER="${SCRAPER_DB_USER:-${SCRAPER_DB_USERNAME:-scraper}}"
+# Postgres container name differs between dev (greenway_postgres) and prod
+# (greenway_postgres_prod). Try both.
+DB_CONTAINER="${DB_CONTAINER:-greenway_postgres_prod}"
+DB_CONTAINER_ALT="${DB_CONTAINER_ALT:-greenway_postgres}"
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -34,7 +38,8 @@ NC='\033[0m' # No Color
 
 # Helper function to run SQL
 run_sql() {
-    docker exec greenway_postgres psql -U "$DB_USER" -d "$DB_NAME" -c "$1" 2>/dev/null || \
+    docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -c "$1" 2>/dev/null || \
+    docker exec "$DB_CONTAINER_ALT" psql -U "$DB_USER" -d "$DB_NAME" -c "$1" 2>/dev/null || \
     psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "$1" 2>/dev/null
 }
 
@@ -191,6 +196,34 @@ cmd_progress() {
     run_sql "SELECT * FROM v_enrichment_progress_summary;"
 }
 
+# Command: Apify Avvo worker + batch status
+cmd_apify() {
+    print_header "APIFY AVVO WORKER STATUS"
+    run_sql "
+    SELECT worker_name, status,
+           to_char(last_heartbeat_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') as last_heartbeat_utc,
+           CASE WHEN last_heartbeat_at > NOW() - INTERVAL '90 seconds' THEN 'RUNNING' ELSE 'STOPPED' END as worker_state
+    FROM worker_heartbeats
+    WHERE worker_name = 'apify_avvo';
+    "
+
+    print_header "APIFY AVVO BATCHES (recent 10)"
+    run_sql "
+    SELECT
+        substr(batch_id::text, 1, 8) as batch,
+        status,
+        (metadata->'apify_run'->>'state') as apify_state,
+        (metadata->'apify_run'->>'apify_status') as apify_run_status,
+        records_processed || '/' || total_records as progress,
+        records_failed,
+        to_char(started_at AT TIME ZONE 'UTC', 'MM-DD HH24:MI') as started
+    FROM enrichment_batches
+    WHERE layer_name = 'avvo'
+    ORDER BY started_at DESC
+    LIMIT 10;
+    "
+}
+
 # Main command dispatcher
 COMMAND="${1:-status}"
 
@@ -222,12 +255,16 @@ case $COMMAND in
     progress)
         cmd_progress
         ;;
+    apify)
+        cmd_apify
+        ;;
     all)
         cmd_status
         cmd_alerts
         cmd_discovery
         cmd_scraping
         cmd_progress
+        cmd_apify
         ;;
     *)
         echo "Unknown command: $COMMAND"
@@ -242,6 +279,7 @@ case $COMMAND in
         echo "  alerts      - Active alert conditions"
         echo "  workers     - Worker performance"
         echo "  progress    - Progress by layer"
+        echo "  apify       - Apify Avvo worker + batch status"
         echo "  all         - Run all checks"
         exit 1
         ;;

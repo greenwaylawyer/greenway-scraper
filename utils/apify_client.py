@@ -94,11 +94,19 @@ class ApifyClient:
         *,
         poll_seconds: int = 5,
         timeout_seconds: Optional[int] = None,
+        on_status: Optional[Any] = None,
     ) -> str:
-        """Poll until the run reaches a terminal status; return the status."""
+        """Poll until the run reaches a terminal status; return the status.
+
+        If ``on_status`` is provided it is awaited with the current run status
+        after every poll, so callers can report progress (e.g. write a
+        heartbeat or update a batch row) while the actor runs.
+        """
         elapsed = 0.0
         while True:
             status = await self.get_run_status(run_id)
+            if on_status is not None:
+                await on_status(status)
             if status in TERMINAL_STATUSES:
                 return status
             if timeout_seconds and elapsed >= timeout_seconds:
