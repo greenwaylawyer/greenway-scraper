@@ -730,6 +730,58 @@ CREATE TRIGGER update_enrichment_batches_updated_at
     EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================================================
+-- Batch progress aggregation
+-- ============================================================================
+-- Keeps enrichment_batches counters in sync with enrichment_source_requests so
+-- per-profile bulk actions (e.g. "Request Google Maps Enrichment") are tracked
+-- live on the Batches admin page without a dedicated worker.
+CREATE OR REPLACE FUNCTION sync_batch_from_source_requests() RETURNS trigger AS $$
+DECLARE
+    b_id uuid := COALESCE(NEW.batch_id, OLD.batch_id);
+BEGIN
+    IF b_id IS NULL THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+
+    UPDATE enrichment_batches b
+    SET
+        total_records = GREATEST(b.total_records, sub.total),
+        records_processed = sub.processed,
+        records_created = sub.completed,
+        records_failed = sub.failed,
+        progress_percent = CASE WHEN sub.total > 0 THEN ROUND((sub.processed::numeric / sub.total) * 100, 2) ELSE 0 END,
+        status = CASE
+            WHEN sub.total > 0 AND sub.processed >= sub.total THEN 'completed'
+            WHEN sub.total > 0 AND sub.failed >= sub.total THEN 'failed'
+            ELSE 'running'
+        END,
+        completed_at = CASE
+            WHEN sub.total > 0 AND sub.processed >= sub.total THEN NOW()
+            ELSE b.completed_at
+        END,
+        updated_at = NOW()
+    FROM (
+        SELECT
+            COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE scrape_status IN ('completed', 'no_data'))::int AS processed,
+            COUNT(*) FILTER (WHERE scrape_status = 'completed')::int AS completed,
+            COUNT(*) FILTER (WHERE scrape_status = 'failed')::int AS failed
+        FROM enrichment_source_requests
+        WHERE batch_id = b_id
+    ) sub
+    WHERE b.batch_id = b_id;
+
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_source_requests_batch ON enrichment_source_requests;
+CREATE TRIGGER trg_source_requests_batch
+    AFTER INSERT OR UPDATE OR DELETE ON enrichment_source_requests
+    FOR EACH ROW
+    EXECUTE FUNCTION sync_batch_from_source_requests();
+
+-- ============================================================================
 -- Sample queries for monitoring
 -- ============================================================================
 
