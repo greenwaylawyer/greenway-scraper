@@ -8,7 +8,7 @@
 # ============================================================================
 
 mvp_google_first:
-  enabled: false
+  enabled: true
   target_total_profiles: 10000
   city_tiers:
     tier1:
@@ -105,11 +105,19 @@ sources:
     name: Avvo
     layer: 3
     icon: avvo
-    enabled: true
-    scraper_module: scrapers.enrichers.avvo
-    scraper_class: AvvoEnricher
-    rate_limit: 8  # requests per minute
+    enabled: true  # routed through Apify (see api_module) — browser scraping is blocked in prod
+    api_module: scrapers.enrichers.apify_avvo
+    api_class: ApifyAvvoEnricher
+    rate_limit: 5  # Apify runs per minute (bulk worker batches many profiles per run)
     state_specific: false
+    apify:
+      # fatihtahta/avvo-scraper — Avvo Scraper with Mails | US Lawyer Directory.
+      actor_id: "LfLFZ56UVZYR73Fer"
+      timeout_seconds: 1800
+      input:
+        proxyConfiguration:
+          useApifyProxy: true
+          apifyProxyGroups: ["RESIDENTIAL"]
     discovery:
       strategies:
         - name_city_search
@@ -128,6 +136,11 @@ sources:
       - awards
       - languages
       - photo_url
+      - phone
+      - address
+      - avvo_rating
+      - client_rating
+      - client_review_count
       - websites
       - social_links
 

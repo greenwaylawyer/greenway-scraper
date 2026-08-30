@@ -30,6 +30,7 @@ from workers.discovery_worker import DiscoveryWorker
 from workers.scraping_worker import ScrapingWorker
 from workers.google_discovery_worker import GoogleDiscoveryWorker
 from workers.ai_merge_worker import AIMergeWorker
+from workers.apify_bulk_worker import ApifyBulkWorker
 from pipeline.mvp_publish_gate import MVPPublishGate
 from config.loader import get_enabled_sources
 from utils.logger import get_logger
@@ -99,6 +100,33 @@ async def run_layer4_worker(args):
         logger.info("Layer 4 worker completed one cycle", **worker.stats)
     else:
         await worker.run(poll_interval=args.poll_interval or 30)
+
+
+async def run_apify_avvo(args):
+    """Run Apify Avvo bulk enrichment/discovery (single actor run over the batch)."""
+    logger.info(
+        "Starting Apify Avvo bulk worker",
+        mode=getattr(args, "mode", "enrich"),
+        batch_size=args.batch_size,
+        limit=args.limit,
+        dry_run=args.dry_run,
+    )
+    from workers.apify_bulk_worker import ApifyBulkWorker
+
+    worker = ApifyBulkWorker(
+        mode=getattr(args, "mode", "enrich"),
+        batch_size=args.batch_size or 1000,
+        dry_run=args.dry_run,
+        limit=args.limit,
+        states=getattr(args, "states", None),
+    )
+
+    if getattr(args, "poll_batches", False):
+        await worker.run_batch_loop(poll_interval=args.poll_interval or 20)
+        return
+
+    stats = await worker.run()
+    logger.info("Apify Avvo bulk complete", **stats)
 
 
 async def run_all_workers(args):
@@ -207,7 +235,7 @@ def main():
     
     parser.add_argument(
         '--worker',
-        choices=['discovery', 'scraping', 'layer4', 'all', 'mvp_google_first'],
+        choices=['discovery', 'scraping', 'layer4', 'all', 'mvp_google_first', 'apify_avvo'],
         required=True,
         help='Which worker to run',
     )
@@ -252,6 +280,17 @@ def main():
         nargs='*',
         help='Optional state codes for mvp_google_first (e.g. CA NY)',
     )
+    parser.add_argument(
+        '--mode',
+        choices=['enrich', 'discover'],
+        default='enrich',
+        help='Apify Avvo worker mode (enrich existing targets vs discover new profiles)',
+    )
+    parser.add_argument(
+        '--poll-batches',
+        action='store_true',
+        help='Poll enrichment_batches for Filament-triggered Apify runs',
+    )
     
     args = parser.parse_args()
     
@@ -271,6 +310,8 @@ def main():
             asyncio.run(run_all_workers(args))
         elif args.worker == 'mvp_google_first':
             asyncio.run(run_mvp_google_first(args))
+        elif args.worker == 'apify_avvo':
+            asyncio.run(run_apify_avvo(args))
     except KeyboardInterrupt:
         logger.info("Worker interrupted by user")
         sys.exit(0)
