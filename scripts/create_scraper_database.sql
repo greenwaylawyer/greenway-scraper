@@ -111,6 +111,17 @@ CREATE INDEX IF NOT EXISTS idx_enrichment_updated ON lawyer_enrichment(updated_a
 CREATE INDEX IF NOT EXISTS idx_enrichment_curated ON lawyer_enrichment(manually_curated) WHERE manually_curated = true;
 CREATE INDEX IF NOT EXISTS idx_enrichment_shortlisted ON lawyer_enrichment(shortlisted) WHERE shortlisted = true;
 
+-- Performance indexes for the admin list page (sort / filter / search).
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS idx_enrichment_created_at ON lawyer_enrichment(created_at);
+CREATE INDEX IF NOT EXISTS idx_enrichment_last_enriched ON lawyer_enrichment(last_enriched_at);
+CREATE INDEX IF NOT EXISTS idx_enrichment_promoted_at ON lawyer_enrichment(promoted_at);
+CREATE INDEX IF NOT EXISTS idx_enrichment_full_name ON lawyer_enrichment(full_name);
+CREATE INDEX IF NOT EXISTS idx_enrichment_not_promoted ON lawyer_enrichment(id) WHERE promoted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_enrichment_practice_areas ON lawyer_enrichment USING gin((merged_data->'practice_areas'));
+CREATE INDEX IF NOT EXISTS idx_enrichment_full_name_trgm ON lawyer_enrichment USING gin(full_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_enrichment_bar_number_trgm ON lawyer_enrichment USING gin(bar_number gin_trgm_ops);
+
 -- ============================================================================
 -- Table: enrichment_batches
 -- ============================================================================
