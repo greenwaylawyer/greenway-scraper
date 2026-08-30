@@ -424,7 +424,7 @@ class ScrapingWorker:
             'bar_number': merged_data.get('bar_number'),
             'license_state': merged_data.get('license_state') or address.get('state') or merged_data.get('state'),
             'license_status': merged_data.get('license_status'),
-            'admission_date': merged_data.get('admission_date'),
+            'admission_date': self._coerce_date(merged_data.get('admission_date')),
             'city': address.get('city') or merged_data.get('city'),
             'state': address.get('state') or merged_data.get('state'),
         }
@@ -433,8 +433,18 @@ class ScrapingWorker:
         if not values:
             return
 
-        set_clause = ", ".join(f"{col} = COALESCE(NULLIF(%s, ''), {col})" for col in values)
-        params = list(values.values()) + [lawyer_enrichment_id]
+        # admission_date is a DATE column — pass a date object and skip the
+        # NULLIF(...,'') text comparison, which would raise
+        # "COALESCE types text and date cannot be matched".
+        set_parts: List[str] = []
+        params: List[Any] = []
+        for col, val in values.items():
+            if col == 'admission_date':
+                set_parts.append(f"{col} = COALESCE({col}, %s)")
+            else:
+                set_parts.append(f"{col} = COALESCE(NULLIF(%s, ''), {col})")
+            params.append(val)
+        params.append(lawyer_enrichment_id)
 
         conn = self._get_db_connection()
         try:
@@ -442,7 +452,7 @@ class ScrapingWorker:
                 cursor.execute(
                     f"""
                     UPDATE lawyer_enrichment
-                    SET {set_clause}, updated_at = NOW()
+                    SET {", ".join(set_parts)}, updated_at = NOW()
                     WHERE id = %s
                     """,
                     params,
@@ -450,6 +460,23 @@ class ScrapingWorker:
             conn.commit()
         finally:
             conn.close()
+
+    @staticmethod
+    def _coerce_date(value: Any) -> Any:
+        """Coerce a merged_data admission_date value to a datetime.date (or None)."""
+        if value is None or value == '':
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, str):
+            text = value.strip()
+            for fmt in ('%Y-%m-%d', '%Y-%m', '%Y', '%m/%d/%Y'):
+                try:
+                    return datetime.strptime(text, fmt).date()
+                except ValueError:
+                    continue
+            return None
+        return value
 
     async def _update_request_no_data(self, request_id: int):
         """Update request as no_data (page found but empty)."""
