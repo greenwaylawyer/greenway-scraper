@@ -280,8 +280,9 @@ def run(dry_run: bool) -> Dict[str, int]:
                 if not dry_run:
                     merge_group(winner, loser, conn)
                 stats["merged"] += 1
-        if not dry_run:
-            conn.commit()
+
+            if not dry_run:
+                conn.commit()
     finally:
         conn.close()
     return stats
