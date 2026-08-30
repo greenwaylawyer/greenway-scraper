@@ -192,7 +192,7 @@ sources:
       verification_fields:
         - formatted_address
         - formatted_phone_number
-      confidence_threshold: 0.85
+      confidence_threshold: 0.60
     fields_provided:
       - rating
       - review_count
