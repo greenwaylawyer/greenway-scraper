@@ -763,7 +763,8 @@ BEGIN
     FROM (
         SELECT
             COUNT(*)::int AS total,
-            COUNT(*) FILTER (WHERE scrape_status IN ('completed', 'no_data'))::int AS processed,
+            COUNT(*) FILTER (WHERE scrape_status IN ('completed', 'no_data')
+                                  OR discovery_status IN ('not_found', 'skipped'))::int AS processed,
             COUNT(*) FILTER (WHERE scrape_status = 'completed')::int AS completed,
             COUNT(*) FILTER (WHERE scrape_status = 'failed')::int AS failed
         FROM enrichment_source_requests
