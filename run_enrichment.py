@@ -122,7 +122,7 @@ async def run_apify_avvo(args):
     )
 
     if getattr(args, "poll_batches", False):
-        await worker.run_batch_loop(poll_interval=args.poll_interval or 20)
+        await worker.run_batch_loop(poll_interval=args.poll_interval or 20, once=getattr(args, "once", False))
         return
 
     stats = await worker.run()

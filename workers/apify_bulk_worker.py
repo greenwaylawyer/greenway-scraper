@@ -417,6 +417,7 @@ class ApifyBulkWorker:
         state = mapped.get("license_state") or (address.get("state") if isinstance(address, dict) else None)
         full_name = mapped.get("full_name")
         fingerprint = self._fingerprint(mapped)
+        source_url = mapped.get("source_profile_url")
 
         conn = self._conn()
         try:
@@ -437,6 +438,7 @@ class ApifyBulkWorker:
                         state = COALESCE(lawyer_enrichment.state, EXCLUDED.state),
                         license_state = COALESCE(lawyer_enrichment.license_state, EXCLUDED.license_state),
                         updated_at = NOW()
+                    RETURNING id
                     """,
                     (
                         fingerprint,
@@ -450,9 +452,16 @@ class ApifyBulkWorker:
                         state,
                     ),
                 )
+                row = cursor.fetchone()
+                lawyer_id = row[0]
             conn.commit()
         finally:
             conn.close()
+
+        # Flag the profile as scraped from Avvo so the admin UI source icons
+        # and enrichment_layers reflect it (discover mode previously only wrote
+        # raw_data_by_source, not a request row).
+        self._upsert_request(lawyer_id, source_url, mapped)
 
     # ── orchestration ────────────────────────────────────────────────────────
 
@@ -637,20 +646,31 @@ class ApifyBulkWorker:
             self._on_apify_status = None
             self._batch_id = None
 
-    async def run_batch_loop(self, poll_interval: int = 20):
+    async def run_batch_loop(self, poll_interval: int = 20, once: bool = False):
         self._ensure_heartbeat_table()
-        logger.info("Apify Avvo batch poller started", poll_interval=poll_interval)
+        logger.info("Apify Avvo batch poller started", poll_interval=poll_interval, once=once)
         while True:
             try:
                 batch = self._claim_batch()
-                if batch:
-                    logger.info("Claimed Apify Avvo batch", batch_id=batch["batch_id"])
-                    await self.process_batch(batch)
-                else:
-                    self._heartbeat("idle")
             except Exception as exc:
                 logger.error("Apify Avvo batch loop error", error=str(exc), exc_info=True)
                 self._heartbeat("error", {"error": str(exc)})
+                if once:
+                    break
+                await asyncio.sleep(poll_interval)
+                continue
+
+            if batch:
+                logger.info("Claimed Apify Avvo batch", batch_id=batch["batch_id"])
+                await self.process_batch(batch)
+                if once:
+                    continue
+            else:
+                self._heartbeat("idle")
+                if once:
+                    logger.info("No queued Apify Avvo batches; exiting (--once)")
+                    break
+
             await asyncio.sleep(poll_interval)
 
 
@@ -664,6 +684,7 @@ async def main():
     parser.add_argument("--states", nargs="*", help="State codes for discover mode")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--poll-batches", action="store_true", help="Poll enrichment_batches for Filament-triggered runs")
+    parser.add_argument("--once", action="store_true", help="Process queued batches once then exit (on-demand)")
     parser.add_argument("--poll-interval", type=int, default=20)
     args = parser.parse_args()
 
@@ -673,7 +694,7 @@ async def main():
     )
 
     if args.poll_batches:
-        await worker.run_batch_loop(poll_interval=args.poll_interval)
+        await worker.run_batch_loop(poll_interval=args.poll_interval, once=args.once)
         return
 
     stats = await worker.run()
