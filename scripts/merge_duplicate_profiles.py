@@ -51,8 +51,12 @@ def _conn():
     )
 
 
-def name_key(full_name: Optional[str], state: Optional[str]) -> Optional[Tuple[str, str, str]]:
-    """Return a canonical (first, last, state) key or None if unparseable."""
+def name_key(full_name: Optional[str], state: Optional[str], city: Optional[str]) -> Optional[Tuple[str, str, str, str]]:
+    """Return a canonical (first, last, state, city) key or None if unparseable.
+
+    City is included (and required) so distinct people who share a common name
+    in the same state are not merged. Rows without a city are never merged.
+    """
     if not full_name:
         return None
     parsed = NameNormalizer.parse(full_name)
@@ -63,7 +67,10 @@ def name_key(full_name: Optional[str], state: Optional[str]) -> Optional[Tuple[s
     if not first or not last:
         return None
     st = (state or "").strip().lower()
-    return (first, last, st)
+    ct = (city or "").strip().lower()
+    if not ct:
+        return None
+    return (first, last, st, ct)
 
 
 def _union_list(a: List[Any], b: List[Any]) -> List[Any]:
@@ -104,7 +111,7 @@ def fetch_lightweight() -> List[Dict[str, Any]]:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(
                 """
-                SELECT id, full_name, state, license_state, completeness_score
+                SELECT id, full_name, state, license_state, city, completeness_score
                 FROM lawyer_enrichment
                 WHERE full_name IS NOT NULL
                 """
@@ -134,7 +141,11 @@ def group_duplicates(light_rows: List[Dict[str, Any]]) -> List[List[int]]:
     """Return lists of duplicate id-groups."""
     groups: Dict[Tuple, List[Dict[str, Any]]] = defaultdict(list)
     for p in light_rows:
-        key = name_key(p.get("full_name"), p.get("state") or p.get("license_state"))
+        key = name_key(
+            p.get("full_name"),
+            p.get("state") or p.get("license_state"),
+            p.get("city"),
+        )
         if key:
             groups[key].append(p)
     return [[p["id"] for p in g] for g in groups.values() if len(g) > 1]
