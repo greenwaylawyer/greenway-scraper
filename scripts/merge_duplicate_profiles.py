@@ -5,6 +5,9 @@ manual entry) create separate rows for the same person with different
 fingerprints. This script detects duplicates by (first name, last name, state)
 and merges the lower-quality rows into the best one.
 
+Memory-safe: duplicate detection runs on lightweight identity columns only;
+full JSONB payloads are loaded solely for the (small) duplicate groups.
+
 Usage:
     python scripts/merge_duplicate_profiles.py --dry-run   # report only
     python scripts/merge_duplicate_profiles.py             # actually merge
@@ -30,6 +33,12 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 load_dotenv(override=True)
+
+FULL_COLUMNS = (
+    "id, fingerprint, full_name, city, state, license_state, "
+    "completeness_score, enrichment_layers, merged_data, raw_data_by_source, "
+    "google_place_id, google_rating, google_review_count, geo_lat, geo_lng"
+)
 
 
 def _conn():
@@ -88,19 +97,17 @@ def deep_merge(winner: Dict[str, Any], loser: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def fetch_profiles() -> List[Dict[str, Any]]:
+def fetch_lightweight() -> List[Dict[str, Any]]:
+    """Fetch identity columns only — keeps memory bounded at ~374k profiles."""
     conn = _conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(
                 """
-                SELECT id, fingerprint, full_name, city, state, license_state,
-                       completeness_score, enrichment_layers, merged_data,
-                       raw_data_by_source, google_place_id, google_rating,
-                       google_review_count, geo_lat, geo_lng
+                SELECT id, full_name, state, license_state, completeness_score,
+                       jsonb_array_length(enrichment_layers) AS layer_count
                 FROM lawyer_enrichment
                 WHERE full_name IS NOT NULL
-                ORDER BY id
                 """
             )
             return [dict(r) for r in cursor.fetchall()]
@@ -108,13 +115,30 @@ def fetch_profiles() -> List[Dict[str, Any]]:
         conn.close()
 
 
-def group_duplicates(profiles: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+def fetch_members(ids: List[int]) -> List[Dict[str, Any]]:
+    """Fetch full rows (with JSONB) for a small set of ids."""
+    if not ids:
+        return []
+    conn = _conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(
+                f"SELECT {FULL_COLUMNS} FROM lawyer_enrichment WHERE id = ANY(%s)",
+                (ids,),
+            )
+            return [dict(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def group_duplicates(light_rows: List[Dict[str, Any]]) -> List[List[int]]:
+    """Return lists of duplicate id-groups."""
     groups: Dict[Tuple, List[Dict[str, Any]]] = defaultdict(list)
-    for p in profiles:
+    for p in light_rows:
         key = name_key(p.get("full_name"), p.get("state") or p.get("license_state"))
         if key:
             groups[key].append(p)
-    return [g for g in groups.values() if len(g) > 1]
+    return [[p["id"] for p in g] for g in groups.values() if len(g) > 1]
 
 
 def pick_winner(group: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -133,12 +157,10 @@ def merge_group(winner: Dict[str, Any], loser: Dict[str, Any], conn):
     winner_id = winner["id"]
     loser_id = loser["id"]
 
-    # 1. Merge raw_data_by_source (winner wins per source_key).
     raw = dict(winner.get("raw_data_by_source") or {})
     for source_key, payload in (loser.get("raw_data_by_source") or {}).items():
         raw.setdefault(source_key, payload)
 
-    # 2. Merge merged_data + recompute completeness.
     merged = deep_merge(winner.get("merged_data") or {}, loser.get("merged_data") or {})
     score = MergeEngine().calculate_completeness_score(merged)
 
@@ -153,7 +175,6 @@ def merge_group(winner: Dict[str, Any], loser: Dict[str, Any], conn):
     }
 
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-        # 3. Re-point or delete the loser's source requests.
         cursor.execute(
             "SELECT source_key FROM enrichment_source_requests WHERE lawyer_enrichment_id = %s",
             (winner_id,),
@@ -173,7 +194,6 @@ def merge_group(winner: Dict[str, Any], loser: Dict[str, Any], conn):
                     (winner_id, req["id"]),
                 )
 
-        # 4. Re-point related records.
         cursor.execute(
             "UPDATE promotion_log SET lawyer_enrichment_id = %s WHERE lawyer_enrichment_id = %s",
             (winner_id, loser_id),
@@ -183,7 +203,6 @@ def merge_group(winner: Dict[str, Any], loser: Dict[str, Any], conn):
             (winner_id, loser_id),
         )
 
-        # 5. Update the winner.
         cursor.execute(
             """
             UPDATE lawyer_enrichment
@@ -219,22 +238,26 @@ def merge_group(winner: Dict[str, Any], loser: Dict[str, Any], conn):
             ),
         )
 
-        # 6. Delete the loser.
         cursor.execute("DELETE FROM lawyer_enrichment WHERE id = %s", (loser_id,))
 
 
 def run(dry_run: bool) -> Dict[str, int]:
-    profiles = fetch_profiles()
-    groups = group_duplicates(profiles)
+    light_rows = fetch_lightweight()
+    logger.info("Loaded profiles", total=len(light_rows))
 
-    stats = {"groups": len(groups), "duplicates": 0, "merged": 0}
-    if not groups:
+    dup_groups = group_duplicates(light_rows)
+    stats = {"groups": len(dup_groups), "duplicates": 0, "merged": 0}
+    if not dup_groups:
         logger.info("No duplicate profiles found")
         return stats
 
+    all_ids = [i for g in dup_groups for i in g]
+    members = {r["id"]: r for r in fetch_members(all_ids)}
+
     conn = _conn()
     try:
-        for group in groups:
+        for id_group in dup_groups:
+            group = [members[i] for i in id_group]
             winner = pick_winner(group)
             losers = [p for p in group if p["id"] != winner["id"]]
             stats["duplicates"] += len(losers)
