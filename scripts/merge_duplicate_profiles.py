@@ -104,8 +104,7 @@ def fetch_lightweight() -> List[Dict[str, Any]]:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(
                 """
-                SELECT id, full_name, state, license_state, completeness_score,
-                       jsonb_array_length(enrichment_layers) AS layer_count
+                SELECT id, full_name, state, license_state, completeness_score
                 FROM lawyer_enrichment
                 WHERE full_name IS NOT NULL
                 """
