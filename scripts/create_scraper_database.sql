@@ -762,12 +762,13 @@ BEGIN
         records_failed = sub.failed,
         progress_percent = CASE WHEN sub.total > 0 THEN ROUND((sub.processed::numeric / sub.total) * 100, 2) ELSE 0 END,
         status = CASE
-            WHEN sub.total > 0 AND sub.processed >= sub.total THEN 'completed'
+            WHEN b.status = 'cancelled' THEN 'cancelled'
             WHEN sub.total > 0 AND sub.failed >= sub.total THEN 'failed'
+            WHEN sub.total > 0 AND (sub.processed + sub.failed) >= sub.total THEN 'completed'
             ELSE 'running'
         END,
         completed_at = CASE
-            WHEN sub.total > 0 AND sub.processed >= sub.total THEN NOW()
+            WHEN sub.total > 0 AND (sub.processed + sub.failed) >= sub.total THEN NOW()
             ELSE b.completed_at
         END,
         updated_at = NOW()
