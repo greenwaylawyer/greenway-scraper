@@ -225,6 +225,19 @@ async def run_mvp_google_first(args):
     logger.info("Publish gate complete", **gate_stats)
 
 
+async def run_google_discovery_batch(args):
+    """Run Google discovery batches created from the admin panel (DB-as-queue)."""
+    logger.info(
+        "Starting Google discovery batch poller",
+        once=args.once,
+        poll_interval=args.poll_interval,
+    )
+    from workers.google_discovery_batch_worker import GoogleDiscoveryBatchWorker
+
+    worker = GoogleDiscoveryBatchWorker()
+    await worker.run_batch_loop(poll_interval=args.poll_interval or 20, once=args.once)
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -235,7 +248,7 @@ def main():
     
     parser.add_argument(
         '--worker',
-        choices=['discovery', 'scraping', 'layer4', 'all', 'mvp_google_first', 'apify_avvo'],
+        choices=['discovery', 'scraping', 'layer4', 'all', 'mvp_google_first', 'apify_avvo', 'google_discovery'],
         required=True,
         help='Which worker to run',
     )
@@ -312,6 +325,8 @@ def main():
             asyncio.run(run_mvp_google_first(args))
         elif args.worker == 'apify_avvo':
             asyncio.run(run_apify_avvo(args))
+        elif args.worker == 'google_discovery':
+            asyncio.run(run_google_discovery_batch(args))
     except KeyboardInterrupt:
         logger.info("Worker interrupted by user")
         sys.exit(0)
