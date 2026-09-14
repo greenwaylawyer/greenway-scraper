@@ -17,6 +17,7 @@ progress back to the batch row so the admin can monitor it in the panel.
 from __future__ import annotations
 
 import asyncio
+import math
 import hashlib
 import os
 import re
@@ -319,6 +320,7 @@ class ApifyBulkWorker:
 
     def _upsert_request(self, target_id: int, source_url: Optional[str], mapped: Dict[str, Any]):
         conn = self._conn()
+        batch_id = getattr(self, "_batch_id", None)
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -327,10 +329,12 @@ class ApifyBulkWorker:
                         lawyer_enrichment_id, source_key, layer,
                         source_profile_url, discovery_status, scrape_status,
                         discovery_method, scraped_data, scraped_at,
-                        merged_to_profile, merged_at, requested_by, priority
+                        merged_to_profile, merged_at, requested_by, priority,
+                        batch_id, created_at, updated_at
                     ) VALUES (%s, %s, 3, %s, 'found', 'completed',
                               'apify_bulk', %s::jsonb, NOW(),
-                              true, NOW(), 'apify_bulk_worker', 1)
+                              true, NOW(), 'apify_bulk_worker', 1,
+                              %s, NOW(), NOW())
                     ON CONFLICT (lawyer_enrichment_id, source_key) DO UPDATE SET
                         source_profile_url = EXCLUDED.source_profile_url,
                         discovery_status = 'found',
@@ -340,9 +344,10 @@ class ApifyBulkWorker:
                         scraped_at = NOW(),
                         merged_to_profile = true,
                         merged_at = NOW(),
+                        batch_id = COALESCE(EXCLUDED.batch_id, enrichment_source_requests.batch_id),
                         updated_at = NOW()
                     """,
-                    (target_id, self.source_key, source_url, Json(mapped)),
+                    (target_id, self.source_key, source_url, Json(mapped), batch_id),
                 )
             conn.commit()
         finally:
@@ -418,6 +423,8 @@ class ApifyBulkWorker:
         full_name = mapped.get("full_name")
         fingerprint = self._fingerprint(mapped)
         source_url = mapped.get("source_profile_url")
+        threshold = int(os.getenv("COMPLETENESS_THRESHOLD", 80))
+        ready_for_promotion = (score >= threshold)
 
         conn = self._conn()
         try:
@@ -427,8 +434,9 @@ class ApifyBulkWorker:
                     INSERT INTO lawyer_enrichment (
                         fingerprint, enrichment_layers, enrichment_level,
                         raw_data_by_source, merged_data, completeness_score,
-                        full_name, city, state, license_state
-                    ) VALUES (%s, %s::jsonb, 3, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s)
+                        full_name, city, state, license_state,
+                        level_3_completed_at, last_enriched_at, ready_for_promotion
+                    ) VALUES (%s, %s::jsonb, 3, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, NOW(), NOW(), %s)
                     ON CONFLICT (fingerprint) DO UPDATE SET
                         raw_data_by_source = lawyer_enrichment.raw_data_by_source || EXCLUDED.raw_data_by_source,
                         merged_data = lawyer_enrichment.merged_data || EXCLUDED.merged_data,
@@ -437,6 +445,9 @@ class ApifyBulkWorker:
                         city = COALESCE(lawyer_enrichment.city, EXCLUDED.city),
                         state = COALESCE(lawyer_enrichment.state, EXCLUDED.state),
                         license_state = COALESCE(lawyer_enrichment.license_state, EXCLUDED.license_state),
+                        level_3_completed_at = COALESCE(lawyer_enrichment.level_3_completed_at, NOW()),
+                        last_enriched_at = NOW(),
+                        ready_for_promotion = (GREATEST(lawyer_enrichment.completeness_score, EXCLUDED.completeness_score) >= %s AND NOT COALESCE(lawyer_enrichment.promotion_blocked, false) AND lawyer_enrichment.promoted_at IS NULL),
                         updated_at = NOW()
                     RETURNING id
                     """,
@@ -450,6 +461,8 @@ class ApifyBulkWorker:
                         city,
                         state,
                         state,
+                        ready_for_promotion,
+                        threshold,
                     ),
                 )
                 row = cursor.fetchone()
@@ -496,19 +509,36 @@ class ApifyBulkWorker:
     async def _run_discover(self) -> Dict[str, Any]:
         states = self.states or ["ca", "ny", "tx", "fl", "il", "nj", "ma", "ga", "wa", "nc"]
         category = "immigration-lawyer"
-        per_state_limit = self.limit if (self.limit is not None and self.limit > 0) else 1000
+        
+        # Calculate per-state limit so total items requested across all states
+        # respects self.limit rather than multiplying by len(states).
+        if self.limit is not None and self.limit > 0:
+            per_state_limit = max(1, math.ceil(self.limit / len(states)))
+        else:
+            per_state_limit = 1000
 
         items: List[Dict[str, Any]] = []
         for state in states:
+            remaining = (self.limit - len(items)) if (self.limit is not None and self.limit > 0) else None
+            if remaining is not None and remaining <= 0:
+                break
+
+            call_limit = min(per_state_limit, remaining) if remaining is not None else per_state_limit
             self.stats["queries"] += 1
             state_items = await self._run_actor(
                 self._input({
                     "searchByCategory": category,
                     "searchByLocation": state,
-                    "limit": per_state_limit,
+                    "limit": call_limit,
                 })
             )
-            items.extend(self._profile_items(state_items))
+            profile_items = self._profile_items(state_items)
+            if remaining is not None and len(profile_items) > remaining:
+                profile_items = profile_items[:remaining]
+            items.extend(profile_items)
+
+            if remaining is not None and len(items) >= self.limit:
+                break
 
         if self.dry_run:
             logger.info("Dry run — discovered profiles", profiles=len(items))
