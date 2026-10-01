@@ -154,38 +154,38 @@ class BaseEnricher(ABC):
                 candidate.confidence = score
                 return score
 
-        # Last name
-        candidate_name_parts = candidate.name.lower().split()
-        target_last = lawyer.get('last_name', '').lower()
-        target_first = lawyer.get('first_name', '').lower()
-        
+        # Last name — use (or '') to guard against None values in DB
+        candidate_name_parts = (candidate.name or '').lower().split()
+        target_last = (lawyer.get('last_name') or '').lower()
+        target_first = (lawyer.get('first_name') or '').lower()
+
         if target_last and target_last in candidate_name_parts:
             score += 0.30
             signals.append('last_name_match')
-        
+
         # First name
         if target_first and target_first in candidate_name_parts:
             score += 0.20
             signals.append('first_name_match')
-        
+
         # City
-        candidate_location = candidate.location.lower()
-        target_city = lawyer.get('city', '').lower()
+        candidate_location = (candidate.location or '').lower()
+        target_city = (lawyer.get('city') or '').lower()
         if target_city and target_city in candidate_location:
             score += 0.20
             signals.append('city_match')
-        
+
         # State
-        target_state = lawyer.get('state', '').lower()
+        target_state = (lawyer.get('state') or '').lower()
         if not target_state:
-            target_state = lawyer.get('license_state', '').lower()
+            target_state = (lawyer.get('license_state') or '').lower()
         if target_state and target_state in candidate_location:
             score += 0.10
             signals.append('state_match')
-        
+
         # Name similarity (fuzzy match as bonus)
-        target_full = lawyer.get('full_name', '').lower()
-        candidate_full = candidate.name.lower()
+        target_full = (lawyer.get('full_name') or '').lower()
+        candidate_full = (candidate.name or '').lower()
         if target_full and candidate_full:
             similarity = SequenceMatcher(None, target_full, candidate_full).ratio()
             if similarity >= 0.8:

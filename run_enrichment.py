@@ -38,6 +38,51 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+import json
+import os
+import psycopg2
+
+def record_worker_heartbeat(worker_name: str, status: str = "running", detail: dict = None):
+    """Write heartbeat timestamp to worker_heartbeats table."""
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv('SCRAPER_DB_HOST', 'postgres'),
+            port=int(os.getenv('SCRAPER_DB_PORT', 5432)),
+            database=os.getenv('SCRAPER_DB_NAME', 'greenway_scraper'),
+            user=os.getenv('SCRAPER_DB_USER', 'scraper'),
+            password=os.getenv('SCRAPER_DB_PASSWORD', 'scraper123'),
+        )
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS worker_heartbeats (
+                    worker_name TEXT PRIMARY KEY,
+                    status TEXT,
+                    detail JSONB,
+                    last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                INSERT INTO worker_heartbeats (worker_name, status, detail, last_heartbeat_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (worker_name) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    detail = EXCLUDED.detail,
+                    last_heartbeat_at = NOW()
+            """, (worker_name, status, json.dumps(detail or {})))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.debug(f"Heartbeat write failed: {e}")
+
+async def heartbeat_loop(worker_name: str, interval: int = 15):
+    """Background task to pulse heartbeat periodically."""
+    while True:
+        try:
+            record_worker_heartbeat(worker_name, "running")
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+
 async def run_discovery_worker(args):
     """Run discovery worker."""
     logger.info(
@@ -181,10 +226,15 @@ async def run_all_workers(args):
         logger.warning("No tasks created — check if sources are enabled in config")
         return
     
+    if not args.once:
+        tasks.append(heartbeat_loop("all_workers", interval=15))
+    record_worker_heartbeat("all_workers", "running", {"mode": "once" if args.once else "continuous"})
+
     # Run all tasks
     if args.once:
         await asyncio.gather(*tasks)
         logger.info("All workers completed one cycle")
+        record_worker_heartbeat("all_workers", "idle", {"mode": "once", "completed": True})
     else:
         await asyncio.gather(*tasks)
 
