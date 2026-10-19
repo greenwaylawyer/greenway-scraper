@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
@@ -61,7 +61,12 @@ class AIMergeWorker:
             return source_payload["data"]
         return source_payload if isinstance(source_payload, dict) else {}
 
-    def _deterministic_merge(self, merged_data: Dict[str, Any], raw_data_by_source: Dict[str, Any]) -> Dict[str, Any]:
+    def _deterministic_merge(
+        self,
+        merged_data: Dict[str, Any],
+        raw_data_by_source: Dict[str, Any],
+        curated_fields: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         google = self._extract_source_data(raw_data_by_source, "google_maps") or self._extract_source_data(raw_data_by_source, "google_discovery")
         justia = self._extract_source_data(raw_data_by_source, "justia")
         avvo = self._extract_source_data(raw_data_by_source, "avvo")
@@ -80,7 +85,12 @@ class AIMergeWorker:
 
         profile["full_name"] = profile.get("full_name") or justia.get("full_name") or avvo.get("full_name") or google.get("name")
         profile["email"] = profile.get("email") or justia.get("email") or avvo.get("email")
-        profile["phone"] = profile.get("phone") or google.get("formatted_phone") or justia.get("phone") or avvo.get("phone")
+        # Google Places phone has the highest priority over any existing/Justia/Avvo
+        # phone, unless an admin curated the phone by hand.
+        if "phone" in (curated_fields or []):
+            profile["phone"] = profile.get("phone") or google.get("formatted_phone") or justia.get("phone") or avvo.get("phone")
+        else:
+            profile["phone"] = google.get("formatted_phone") or profile.get("phone") or justia.get("phone") or avvo.get("phone")
         profile["website_url"] = profile.get("website_url") or google.get("website") or justia.get("website") or avvo.get("website")
         profile["google_rating"] = profile.get("google_rating") or google.get("google_rating") or google.get("rating")
         profile["google_review_count"] = profile.get("google_review_count") or google.get("google_review_count") or google.get("review_count")
@@ -110,7 +120,8 @@ class AIMergeWorker:
         client = self._client_or_none()
         merged_data = profile_row.get("merged_data") or {}
         raw_data_by_source = profile_row.get("raw_data_by_source") or {}
-        deterministic = self._deterministic_merge(merged_data, raw_data_by_source)
+        curated_fields = profile_row.get("manually_curated_fields") or []
+        deterministic = self._deterministic_merge(merged_data, raw_data_by_source, curated_fields)
         if not client:
             self.stats["fallback_merged"] += 1
             return deterministic
@@ -118,7 +129,7 @@ class AIMergeWorker:
         system = (
             "You merge lawyer profile data from Google, Justia, and Avvo. "
             "Return JSON only. Keep both google_rating and avvo_rating if present. "
-            "Prefer Google for current address/geocode, Justia/Avvo for bio and email, "
+            "Prefer Google for current address/geocode and phone, Justia/Avvo for bio and email, "
             "union+dedupe practice areas, and preserve existing non-null fields."
         )
         user_payload = {
@@ -145,6 +156,10 @@ class AIMergeWorker:
             self.stats["fallback_merged"] += 1
             return deterministic
         deterministic.update(response)
+        # The Google phone is authoritative; never let the AI response replace it.
+        google = self._extract_source_data(raw_data_by_source, "google_maps") or self._extract_source_data(raw_data_by_source, "google_discovery")
+        if google.get("formatted_phone") and "phone" not in curated_fields:
+            deterministic["phone"] = google["formatted_phone"]
         return deterministic
 
     def _select_batch(self):
@@ -153,7 +168,7 @@ class AIMergeWorker:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
                     """
-                    SELECT id, merged_data, raw_data_by_source
+                    SELECT id, merged_data, raw_data_by_source, manually_curated_fields
                     FROM lawyer_enrichment
                     WHERE promoted_at IS NULL
                       AND COALESCE((merged_data->>'google_discovery_selected')::boolean, false) = true

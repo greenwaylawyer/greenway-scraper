@@ -5,9 +5,13 @@ Two modes:
 - ``enrich``  — pull target profiles (seeded by Google discovery) and run the
   Apify Avvo actor over their Avvo search URLs, then match the returned
   profiles back to the targets and merge. One actor run for the whole batch.
-- ``discover`` — category sweep: run the actor with ``searchByCategory =
-  immigration-lawyer`` (or another category) per state and insert brand-new
-  ``lawyer_enrichment`` rows.
+- ``discover`` — paged category sweep for brand-new ``lawyer_enrichment`` rows.
+  The actor has no paging input (``searchByCategory`` + ``searchByLocation``
+  always return the same top N), so we walk Avvo's own listing pages
+  (``/immigration-lawyer/ca.html?page=N``) with the cheap ``apify/web-fetch``
+  actor, drop lawyers we already have (by Avvo ID), and send only new profile
+  URLs to the paid Avvo actor. A cursor per (category, state) in
+  ``apify_avvo_sweep`` makes the next run continue where the last one stopped.
 
 The worker can also poll the ``enrichment_batches`` table for rows created by
 the Filament admin ("Start Apify Avvo Run") and execute them, reporting
@@ -38,6 +42,37 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 load_dotenv(override=True)
+
+
+AVVO_BASE = "https://www.avvo.com"
+LISTING_FETCH_ACTOR = "apify~web-fetch"
+PROFILE_URL_RE = re.compile(r"^https?://www\.avvo\.com/attorneys/[^?#]*?-(\d+)\.html")
+# Avvo IDs also appear as the trailing number of stored profile URLs.
+AVVO_ID_FROM_URL_RE = re.compile(r"-(\d+)\.html")
+
+
+def avvo_id_from_url(url: Optional[str]) -> Optional[str]:
+    match = AVVO_ID_FROM_URL_RE.search(url or "")
+    return match.group(1) if match else None
+
+
+def parse_listing_links(links: List[str], listing_url: str) -> Tuple[Dict[str, str], Optional[int]]:
+    """Return ({avvo_id: canonical profile URL}, last page number) from a listing page's links."""
+    profiles: Dict[str, str] = {}
+    for link in links or []:
+        match = PROFILE_URL_RE.match(link or "")
+        if match and match.group(1) not in profiles:
+            profiles[match.group(1)] = match.group(0)
+
+    base = listing_url.split("?", 1)[0]
+    last_page: Optional[int] = None
+    for link in links or []:
+        if not (link or "").startswith(base + "?"):
+            continue
+        page = re.search(r"[?&]page=(\d+)", link)
+        if page and "sort=" not in link:
+            last_page = max(last_page or 0, int(page.group(1)))
+    return profiles, last_page
 
 
 def _normalize(value: Any) -> str:
@@ -79,6 +114,11 @@ class ApifyBulkWorker:
             "inserted": 0,
             "merged": 0,
             "errors": 0,
+            # discover mode
+            "listing_pages": 0,
+            "listings_seen": 0,
+            "already_known": 0,
+            "new_profiles_queued": 0,
         }
 
     def _conn(self):
@@ -506,45 +546,244 @@ class ApifyBulkWorker:
                 self.stats["errors"] += 1
         return self.stats
 
+    # ── discover mode (paged sweep) ─────────────────────────────────────────
+
+    def _ensure_sweep_table(self):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS apify_avvo_sweep (
+                        category TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        next_page INTEGER NOT NULL DEFAULT 1,
+                        last_page INTEGER,
+                        pages_scanned INTEGER NOT NULL DEFAULT 0,
+                        listings_seen INTEGER NOT NULL DEFAULT 0,
+                        new_profiles INTEGER NOT NULL DEFAULT 0,
+                        completed_at TIMESTAMPTZ,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (category, state)
+                    )
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _load_slots(self, category: str, states: List[str]) -> List[Dict[str, Any]]:
+        """Sweep cursors for the states, creating missing ones; finished sweeps restart after resweep_days."""
+        resweep_days = int(self._discover_config().get("resweep_days", 30))
+        conn = self._conn()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                for state in states:
+                    cursor.execute(
+                        "INSERT INTO apify_avvo_sweep (category, state) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                        (category, state),
+                    )
+                cursor.execute(
+                    """
+                    UPDATE apify_avvo_sweep
+                    SET next_page = 1, completed_at = NULL, updated_at = NOW()
+                    WHERE category = %s AND state = ANY(%s)
+                      AND completed_at IS NOT NULL
+                      AND completed_at < NOW() - make_interval(days => %s)
+                    """,
+                    (category, states, resweep_days),
+                )
+                cursor.execute(
+                    """
+                    SELECT * FROM apify_avvo_sweep
+                    WHERE category = %s AND state = ANY(%s) AND completed_at IS NULL
+                    ORDER BY array_position(%s, state)
+                    """,
+                    (category, states, states),
+                )
+                rows = [dict(r) for r in cursor.fetchall()]
+            conn.commit()
+            return rows
+        finally:
+            conn.close()
+
+    def _save_slot(self, slot: Dict[str, Any], pages: int, seen: int, new: int):
+        if self.dry_run:
+            return
+        done = slot.get("last_page") is not None and slot["next_page"] > slot["last_page"]
+        conn = self._conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE apify_avvo_sweep
+                    SET next_page = %s, last_page = %s,
+                        pages_scanned = pages_scanned + %s,
+                        listings_seen = listings_seen + %s,
+                        new_profiles = new_profiles + %s,
+                        completed_at = CASE WHEN %s THEN NOW() ELSE NULL END,
+                        updated_at = NOW()
+                    WHERE category = %s AND state = %s
+                    """,
+                    (slot["next_page"], slot.get("last_page"), pages, seen, new, done, slot["category"], slot["state"]),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _known_avvo_ids(self) -> set:
+        """Avvo IDs already in lawyer_enrichment (from stored avvo_id or profile URLs)."""
+        conn = self._conn()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT raw_data_by_source->'avvo'->'data'->>'avvo_id',
+                           raw_data_by_source->'avvo'->'data'->>'source_profile_url',
+                           merged_data->>'avvo_id',
+                           merged_data->>'source_profile_url'
+                    FROM lawyer_enrichment
+                    WHERE raw_data_by_source ? 'avvo' OR merged_data ? 'avvo_id'
+                       OR merged_data->>'source_profile_url' LIKE '%%avvo.com/attorneys/%%'
+                    UNION ALL
+                    SELECT NULL, source_profile_url, NULL, NULL
+                    FROM enrichment_source_requests
+                    WHERE source_key = 'avvo' AND source_profile_url IS NOT NULL
+                    """
+                )
+                known = set()
+                for raw_id, raw_url, merged_id, merged_url in cursor.fetchall():
+                    # The actor's id is the profile slug ("90064-ca-name-75849.html").
+                    for value in (raw_id, merged_id):
+                        avvo_id = str(value) if value and str(value).isdigit() else avvo_id_from_url(value)
+                        if avvo_id:
+                            known.add(avvo_id)
+                    for url in (raw_url, merged_url):
+                        avvo_id = avvo_id_from_url(url) if "avvo.com" in (url or "") else None
+                        if avvo_id:
+                            known.add(avvo_id)
+                return known
+        finally:
+            conn.close()
+
+    def _discover_config(self) -> Dict[str, Any]:
+        return self._config().get("apify", {}).get("discover") or {}
+
+    async def _fetch_listing(self, url: str) -> Optional[Dict[str, Any]]:
+        """Fetch one Avvo listing page via apify/web-fetch; None when it fails."""
+        try:
+            run_id = await self.client.run_actor(LISTING_FETCH_ACTOR, {"url": url, "formats": ["links"]})
+            status = await self.client.wait_for_finish(run_id, poll_seconds=3, timeout_seconds=180)
+            if status != "SUCCEEDED":
+                logger.warning("Listing fetch failed", url=url, status=status)
+                return None
+            items = await self.client.get_dataset_items(run_id, limit=1)
+        except ApifyError as exc:
+            logger.warning("Listing fetch failed", url=url, error=str(exc))
+            return None
+        return items[0] if items else None
+
+    async def _collect_new_profile_urls(self, category: str, states: List[str], budget: int) -> List[str]:
+        """Walk listing pages from each state's cursor until `budget` new profile URLs are found.
+
+        Every new profile on a scanned page is returned (the cursor moves past the page),
+        so the result can exceed `budget` by up to one page.
+        """
+        max_pages = int(self._discover_config().get("max_listing_pages_per_run", 60))
+        concurrency = int(self._discover_config().get("listing_concurrency", 5))
+
+        known = self._known_avvo_ids()
+        found: Dict[str, str] = {}
+
+        for slot in self._load_slots(category, states):
+            pages = seen = new = 0
+            while len(found) < budget and self.stats["listing_pages"] < max_pages:
+                last_page = slot.get("last_page")
+                if last_page is not None and slot["next_page"] > last_page:
+                    break
+                # A page lists ~20 lawyers; fetch only as many pages as the remaining budget needs.
+                needed_pages = math.ceil((budget - len(found)) / 15)
+                window = min(concurrency, needed_pages, max_pages - self.stats["listing_pages"])
+                page_numbers = [slot["next_page"] + i for i in range(window)]
+                if last_page is not None:
+                    page_numbers = [p for p in page_numbers if p <= last_page]
+
+                base_url = f"{AVVO_BASE}/{category}/{slot['state']}.html"
+                urls = [base_url if p == 1 else f"{base_url}?page={p}" for p in page_numbers]
+                results = await asyncio.gather(*(self._fetch_listing(u) for u in urls))
+
+                empty_page = False
+                for page_no, url, item in zip(page_numbers, urls, results):
+                    if item is None:
+                        # Transient failure: stop here and retry this page next run.
+                        empty_page = True
+                        break
+                    profiles, page_last = parse_listing_links(item.get("links") or [], base_url)
+                    if page_last:
+                        slot["last_page"] = max(slot.get("last_page") or 0, page_last)
+                    slot["next_page"] = page_no + 1
+                    pages += 1
+                    self.stats["listing_pages"] += 1
+                    if not profiles:
+                        # Past the last page: mark the sweep done.
+                        slot["last_page"] = page_no - 1 if page_no > 1 else 1
+                        empty_page = True
+                        break
+                    seen += len(profiles)
+                    for avvo_id, profile_url in profiles.items():
+                        if avvo_id in known or avvo_id in found:
+                            self.stats["already_known"] += 1
+                            continue
+                        found[avvo_id] = profile_url
+                        new += 1
+                await self._report_discover_progress(slot, len(found), budget)
+                if empty_page:
+                    break
+
+            self.stats["listings_seen"] += seen
+            self._save_slot(slot, pages, seen, new)
+            logger.info(
+                "Avvo sweep slot progress",
+                category=category, state=slot["state"], next_page=slot["next_page"],
+                last_page=slot.get("last_page"), pages=pages, seen=seen, new=new,
+            )
+            if len(found) >= budget or self.stats["listing_pages"] >= max_pages:
+                break
+
+        return list(found.values())
+
+    async def _report_discover_progress(self, slot: Dict[str, Any], found: int, budget: int):
+        if self._on_apify_status is None:
+            return
+        await self._on_apify_status(
+            f"SCANNING {slot['state'].upper()} page {slot['next_page'] - 1}"
+            f"{'/' + str(slot['last_page']) if slot.get('last_page') else ''}: {found}/{budget} new"
+        )
+
     async def _run_discover(self) -> Dict[str, Any]:
         states = self.states or ["ca", "ny", "tx", "fl", "il", "nj", "ma", "ga", "wa", "nc"]
-        category = "immigration-lawyer"
-        
-        # Calculate per-state limit so total items requested across all states
-        # respects self.limit rather than multiplying by len(states).
-        if self.limit is not None and self.limit > 0:
-            per_state_limit = max(1, math.ceil(self.limit / len(states)))
-        else:
-            per_state_limit = 1000
+        category = self._discover_config().get("category", "immigration-lawyer")
+        budget = self.limit if (self.limit is not None and self.limit > 0) else 100
 
-        items: List[Dict[str, Any]] = []
-        for state in states:
-            remaining = (self.limit - len(items)) if (self.limit is not None and self.limit > 0) else None
-            if remaining is not None and remaining <= 0:
-                break
+        self._ensure_sweep_table()
+        profile_urls = await self._collect_new_profile_urls(category, states, budget)
+        self.stats["new_profiles_queued"] = len(profile_urls)
+        self.stats["queries"] = len(profile_urls)
 
-            call_limit = min(per_state_limit, remaining) if remaining is not None else per_state_limit
-            self.stats["queries"] += 1
-            state_items = await self._run_actor(
-                self._input({
-                    "searchByCategory": category,
-                    "searchByLocation": state,
-                    "limit": call_limit,
-                })
-            )
-            profile_items = self._profile_items(state_items)
-            if remaining is not None and len(profile_items) > remaining:
-                profile_items = profile_items[:remaining]
-            items.extend(profile_items)
-
-            if remaining is not None and len(items) >= self.limit:
-                break
-
-        if self.dry_run:
-            logger.info("Dry run — discovered profiles", profiles=len(items))
+        if not profile_urls:
+            logger.info("Avvo sweep found no new profiles", states=states, **self.stats)
             return self.stats
 
-        for item in items:
+        if self.dry_run:
+            logger.info("Dry run — new profile URLs", count=len(profile_urls), sample=profile_urls[:5])
+            return self.stats
+
+        # The actor's limit is per query and must be >= 10; a profile URL yields one item.
+        items = await self._run_actor(self._input({"startUrls": profile_urls, "limit": 10}))
+        profile_items = self._profile_items(items)
+        self.stats["items"] = len(profile_items)
+
+        for item in profile_items:
             try:
                 self._insert_discovered(map_actor_item(item))
                 self.stats["inserted"] += 1

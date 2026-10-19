@@ -243,3 +243,66 @@ def test_name_split_skips_single_token():
     normalize_name_split(data)
     assert 'first_name' not in data
     assert 'last_name' not in data
+
+
+def test_google_phone_overrides_existing_phone():
+    """Google Places phone has priority over Justia/Avvo phones."""
+    engine = MergeEngine()
+
+    current = {
+        'phone': '(212) 555-0100',
+        '_field_sources': {'phone': 'avvo'},
+        '_conflicts': {'phone': {'avvo': '(212) 555-0100', 'justia': '(212) 555-0199'}},
+        '_needs_review': ['phone'],
+    }
+    result = engine.merge(
+        current_merged_data=current,
+        scraped_data={'formatted_phone': '(212) 555-0123'},
+        source_key='google_maps',
+        layer=4,
+        manually_curated_fields=[],
+    )
+
+    assert result['phone'] == '(212) 555-0123'
+    assert result['formatted_phone'] == '(212) 555-0123'
+    assert result['_field_sources']['phone'] == 'google_maps'
+    assert 'phone' not in result['_conflicts']
+    assert 'phone' not in result['_needs_review']
+
+
+def test_google_phone_respects_curated_phone():
+    """An admin-curated phone is never replaced by the Google phone."""
+    engine = MergeEngine()
+
+    result = engine.merge(
+        current_merged_data={'phone': '(212) 555-0100'},
+        scraped_data={'formatted_phone': '(212) 555-0123'},
+        source_key='google_maps',
+        layer=4,
+        manually_curated_fields=['phone'],
+    )
+
+    assert result['phone'] == '(212) 555-0100'
+    assert result['formatted_phone'] == '(212) 555-0123'
+
+
+def test_later_avvo_phone_does_not_replace_google_phone():
+    """A Layer 3 phone arriving after Google is a conflict, not an overwrite."""
+    engine = MergeEngine()
+
+    after_google = engine.merge(
+        current_merged_data={},
+        scraped_data={'formatted_phone': '(212) 555-0123'},
+        source_key='google_maps',
+        layer=4,
+        manually_curated_fields=[],
+    )
+    result = engine.merge(
+        current_merged_data=after_google,
+        scraped_data={'phone': '(212) 555-0100'},
+        source_key='avvo',
+        layer=3,
+        manually_curated_fields=[],
+    )
+
+    assert result['phone'] == '(212) 555-0123'
