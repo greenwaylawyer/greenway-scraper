@@ -57,8 +57,14 @@ LAYER_4_FIELDS = {
     'google_photos',
     'place_id',
     'google_maps_url',
-    'formatted_phone_number',  # from Google as verification/gap-fill
+    'formatted_phone',          # Google Places phone (see GOOGLE_PHONE_FIELDS)
+    'formatted_phone_number',
 }
+
+# Google Places phone keys. The Google listing phone is the highest-priority
+# phone across all sources: when present it is promoted into `phone`,
+# overwriting Justia/Avvo, unless an admin has curated `phone`.
+GOOGLE_PHONE_FIELDS = {'formatted_phone', 'formatted_phone_number'}
 
 # Layer 1-2 official source keys
 OFFICIAL_SOURCES = {
@@ -153,6 +159,16 @@ class MergeEngine:
                 updated_data['_field_sources'][field] = source_key
                 self.fields_merged.append(field)
                 logger.debug(f"Layer 4 overwrite: {field}")
+
+                if field in GOOGLE_PHONE_FIELDS and 'phone' not in manually_curated_fields:
+                    previous = updated_data.get('phone')
+                    updated_data['phone'] = value
+                    updated_data['_field_sources']['phone'] = source_key
+                    updated_data['_conflicts'].pop('phone', None)
+                    if 'phone' in updated_data['_needs_review']:
+                        updated_data['_needs_review'].remove('phone')
+                    self.fields_merged.append('phone (google priority)')
+                    logger.debug(f"Google phone priority: {previous!r} -> {value!r}")
                 continue
 
             # RULE 3: Layer 3 enrichment fields — detect conflicts
