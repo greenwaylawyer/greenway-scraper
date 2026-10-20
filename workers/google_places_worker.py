@@ -551,7 +551,7 @@ class GooglePlacesWorker:
             conn.close()
 
     async def _update_request_error(self, profile: Dict[str, Any], error: str):
-        """Mark request as failed."""
+        """Mark request as failed; select_profiles retries it while scrape_attempts < max."""
         conn = self._get_db_connection()
         try:
             with conn.cursor() as cursor:
@@ -560,14 +560,11 @@ class GooglePlacesWorker:
                     UPDATE enrichment_source_requests
                     SET scrape_attempts = scrape_attempts + 1,
                         scrape_error = %s,
-                        scrape_status = CASE 
-                            WHEN scrape_attempts + 1 >= %s THEN 'failed'
-                            ELSE scrape_status
-                        END,
+                        scrape_status = 'failed',
                         updated_at = NOW()
                     WHERE lawyer_enrichment_id = %s AND source_key = %s
                     """,
-                    (error, self.max_attempts, profile['lawyer_enrichment_id'], self.source_key),
+                    (error, profile['lawyer_enrichment_id'], self.source_key),
                 )
                 conn.commit()
         finally:

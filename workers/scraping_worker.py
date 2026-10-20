@@ -498,7 +498,11 @@ class ScrapingWorker:
             conn.close()
 
     async def _update_request_error(self, request_id: int, error: str):
-        """Increment attempts, set error if max reached."""
+        """Increment attempts; re-queue for another try, or 'failed' once max is reached.
+
+        The row is 'scraping' at this point. Leaving it there (the old ELSE
+        scrape_status) meant it was never picked up again and spun in the admin forever.
+        """
         conn = self._get_db_connection()
         try:
             with conn.cursor() as cursor:
@@ -509,7 +513,7 @@ class ScrapingWorker:
                         scrape_error = %s,
                         scrape_status = CASE 
                             WHEN scrape_attempts + 1 >= %s THEN 'failed'
-                            ELSE scrape_status
+                            ELSE 'queued'
                         END,
                         updated_at = NOW()
                     WHERE id = %s
