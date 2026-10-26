@@ -37,6 +37,11 @@ logger = get_logger(__name__)
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "")
 
 
+def is_placeholder_photo(url: Optional[str]) -> bool:
+    """Avvo shows a generic silhouette (amos_assets/no-photo-…) when there is no headshot."""
+    return bool(url) and ("no-photo" in url or "no_photo" in url or "/amos_assets/" in url)
+
+
 async def _fetch_via_flaresolverr(url: str, timeout_ms: int = 60_000) -> str:
     import aiohttp
     payload  = {"cmd": "request.get", "url": url, "maxTimeout": timeout_ms}
@@ -331,19 +336,37 @@ class AvvoEnricher(BaseEnricher):
             logger.error("Avvo profile fetch failed", url=url, error=str(e))
             return None
 
+        try:
+            return self.parse_profile_html(html, url)
+        finally:
+            try:
+                await self.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def parse_profile_html(html: str, url: str) -> Optional[Dict[str, Any]]:
+        """Extract profile fields from an Avvo profile page's HTML.
+
+        Fetcher-independent: used by the browser path above and by the
+        apify/web-fetch path (ApifyAvvoEnricher, ApifyBulkWorker). Returns None
+        when the page has no profile data (e.g. a block or error page).
+        """
         soup = BeautifulSoup(html, "html.parser")
 
         # ── 1. JSON-LD (primary source for structured data) ───────────────────
-        ld = self._extract_jsonld(soup, "LocalBusiness")
+        ld = AvvoEnricher._extract_jsonld(soup, "LocalBusiness")
 
         # Extract identity from JSON-LD (name, phone, address, photo, social)
-        full_name   = self._clean(ld.get("name", "")) or None
-        bio         = self._clean(ld.get("description", "")) or None
+        full_name   = AvvoEnricher._clean(ld.get("name", "")) or None
+        bio         = AvvoEnricher._clean(ld.get("description", "")) or None
         photo_url   = None
         if isinstance(ld.get("image"), dict):
             photo_url = ld["image"].get("url")
         elif isinstance(ld.get("image"), str):
             photo_url = ld["image"]
+        if photo_url and is_placeholder_photo(photo_url):
+            photo_url = None
 
         # Social links from sameAs
         social_links: Dict[str, str] = {}
@@ -359,22 +382,22 @@ class AvvoEnricher(BaseEnricher):
 
         # Practice areas
         practice_areas: List[str] = list(dict.fromkeys(
-            self._clean(a) for a in ld.get("knowsAbout", []) if a
+            AvvoEnricher._clean(a) for a in ld.get("knowsAbout", []) if a
         ))
 
         # Phone
-        phone = self._clean(ld.get("telephone", ""))
+        phone = AvvoEnricher._clean(ld.get("telephone", ""))
         if phone.lower() in {"not available", ""}:
             phone = ""
 
         # Address from LocalBusiness
         addr_obj  = ld.get("address", {})
         address   = {
-            "line1":  self._clean(addr_obj.get("streetAddress", "")),
-            "city":   self._clean(addr_obj.get("addressLocality", "")),
-            "state":  self._clean(addr_obj.get("addressRegion", "")),
-            "zip":    self._clean(addr_obj.get("postalCode", "")),
-            "country": self._clean(addr_obj.get("addressCountry", "")),
+            "line1":  AvvoEnricher._clean(addr_obj.get("streetAddress", "")),
+            "city":   AvvoEnricher._clean(addr_obj.get("addressLocality", "")),
+            "state":  AvvoEnricher._clean(addr_obj.get("addressRegion", "")),
+            "zip":    AvvoEnricher._clean(addr_obj.get("postalCode", "")),
+            "country": AvvoEnricher._clean(addr_obj.get("addressCountry", "")),
         }
         address = {k: v for k, v in address.items() if v}
 
@@ -391,17 +414,17 @@ class AvvoEnricher(BaseEnricher):
             ".license-section, .bar-admission-info"
         )
         if license_section:
-            license_text = self._clean(license_section.get_text(" "))
+            license_text = AvvoEnricher._clean(license_section.get_text(" "))
             for part in re.split(r'\s*[·•|]\s*', license_text):
                 part_lower = part.lower()
                 if 'state' in part_lower:
                     m = re.search(r'state\s*:?\s*(.+)', part, re.I)
                     if m:
-                        license_state = self._clean(m.group(1))
+                        license_state = AvvoEnricher._clean(m.group(1))
                 elif 'status' in part_lower:
                     m = re.search(r'status\s*:?\s*(.+)', part, re.I)
                     if m:
-                        license_status = self._clean(m.group(1))
+                        license_status = AvvoEnricher._clean(m.group(1))
                 elif 'licensed' in part_lower:
                     m = re.search(r'(\d{4})', part)
                     if m:
@@ -413,7 +436,7 @@ class AvvoEnricher(BaseEnricher):
 
         # Fallback: try structured json-ld alternative
         if not bar_number:
-            alt_ld = self._extract_jsonld(soup, "Attorney")
+            alt_ld = AvvoEnricher._extract_jsonld(soup, "Attorney")
             if alt_ld:
                 bar_number = alt_ld.get("barNumber") or alt_ld.get("identifier")
 
@@ -424,7 +447,7 @@ class AvvoEnricher(BaseEnricher):
             ".about-section-bio"
         )
         if bio_html_el:
-            bio_html = self._clean(bio_html_el.get_text(" "))
+            bio_html = AvvoEnricher._clean(bio_html_el.get_text(" "))
             if bio_html and (not bio or len(bio_html) > len(bio)):
                 bio = bio_html
 
@@ -433,7 +456,7 @@ class AvvoEnricher(BaseEnricher):
             pa_section = soup.select_one(".practice-area-and-fees-section")
             if pa_section:
                 for a in pa_section.select(".practice-area-title, .practice-area-title strong, a.practice-area-title"):
-                    t = self._clean(a.get_text(" "))
+                    t = AvvoEnricher._clean(a.get_text(" "))
                     if t:
                         practice_areas.append(t)
                 practice_areas = list(dict.fromkeys(practice_areas))
@@ -473,14 +496,14 @@ class AvvoEnricher(BaseEnricher):
                 entry: Dict[str, Any] = {}
                 year_p  = exp.find("p")
                 if year_p:
-                    entry["year"] = self._clean(year_p.get_text())
+                    entry["year"] = AvvoEnricher._clean(year_p.get_text())
                 strong = exp.find("strong")
                 if strong:
-                    entry["school"] = self._clean(strong.get_text())
+                    entry["school"] = AvvoEnricher._clean(strong.get_text())
                 # Degree is in the <p> after <strong>
                 ps = exp.find_all("p")
                 if len(ps) >= 2:
-                    entry["degree"] = self._clean(ps[1].get_text())
+                    entry["degree"] = AvvoEnricher._clean(ps[1].get_text())
                 if entry:
                     education_history.append(entry)
 
@@ -492,11 +515,11 @@ class AvvoEnricher(BaseEnricher):
                 entry: Dict[str, Any] = {}
                 ps = exp.find_all("p")
                 if ps:
-                    entry["years"] = self._clean(ps[0].get_text())
+                    entry["years"] = AvvoEnricher._clean(ps[0].get_text())
                 strong = exp.find("strong")
                 if strong:
                     # Remove trailing comma / whitespace
-                    entry["role"] = self._clean(strong.get_text()).rstrip(",").strip()
+                    entry["role"] = AvvoEnricher._clean(strong.get_text()).rstrip(",").strip()
                     # Firm name is the text in the same <p> that is NOT in <strong>
                     if len(ps) >= 2:
                         # Extract text nodes that are direct children (not inside <strong>)
@@ -505,12 +528,12 @@ class AvvoEnricher(BaseEnricher):
                             if hasattr(node, "name") and node.name == "strong":
                                 continue
                             firm_parts.append(str(node))
-                        firm = self._clean(" ".join(firm_parts))
+                        firm = AvvoEnricher._clean(" ".join(firm_parts))
                         if firm:
                             entry["firm"] = firm
                 else:
                     if len(ps) >= 2:
-                        entry["firm"] = self._clean(ps[1].get_text())
+                        entry["firm"] = AvvoEnricher._clean(ps[1].get_text())
                 if entry:
                     work_history.append(entry)
 
@@ -518,14 +541,14 @@ class AvvoEnricher(BaseEnricher):
         associations: List[Dict[str, Any]] = []
         assoc_sec = soup.select_one(".associations-container")
         if assoc_sec:
-            associations = self._parse_experience_section(assoc_sec)
+            associations = AvvoEnricher._parse_experience_section(assoc_sec)
 
         # ── 9. Languages ──────────────────────────────────────────────────────
         languages: List[str] = []
         lang_sec = soup.select_one(".languages-container")
         if lang_sec:
             for p in lang_sec.select(".languages-list p"):
-                t = self._clean(p.get_text())
+                t = AvvoEnricher._clean(p.get_text())
                 if t:
                     languages.append(t)
 
@@ -533,7 +556,7 @@ class AvvoEnricher(BaseEnricher):
         publications: List[Dict[str, Any]] = []
         pub_sec = soup.select_one(".publications-container")
         if pub_sec:
-            publications = self._parse_experience_section(pub_sec)
+            publications = AvvoEnricher._parse_experience_section(pub_sec)
 
         # ── 11. Websites (external links not in known social domains) ─────────
         SOCIAL_DOMAINS = {"facebook.com", "twitter.com", "x.com", "linkedin.com",
@@ -546,7 +569,7 @@ class AvvoEnricher(BaseEnricher):
             domain = href.split("/")[2].lstrip("www.")
             if domain in SOCIAL_DOMAINS or "avvo.com" in domain:
                 continue
-            label = self._clean(a.get_text(" ")).lower()
+            label = AvvoEnricher._clean(a.get_text(" ")).lower()
             if "website" in label or "web site" in label or "visit" in label:
                 websites.append(href)
         websites = list(dict.fromkeys(websites))[:5]
@@ -596,9 +619,6 @@ class AvvoEnricher(BaseEnricher):
             client_rating=client_rating,
         )
 
-        try:
-            await self.close()
-        except Exception:
-            pass
-
-        return cleaned if len(cleaned) > 1 or 'source_profile_url' not in cleaned else None
+        if not cleaned.get("full_name"):
+            return None
+        return cleaned

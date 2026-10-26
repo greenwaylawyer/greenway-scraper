@@ -21,6 +21,10 @@ APIFY_BASE = "https://api.apify.com/v2"
 
 TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
 
+# Cheap generic page fetcher. Reads Avvo listing, search and profile pages
+# without being blocked (the dedicated Avvo actor started timing out in Oct 2026).
+WEB_FETCH_ACTOR = "apify~web-fetch"
+
 
 class ApifyError(RuntimeError):
     """Raised when an Apify API call fails or a run does not succeed."""
@@ -137,3 +141,41 @@ class ApifyClient:
         if not isinstance(payload, list):
             raise ApifyError(f"Apify dataset items unexpected shape: {type(payload)}")
         return payload
+
+    async def fetch_page(
+        self,
+        url: str,
+        formats: List[str],
+        *,
+        timeout_seconds: int = 180,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch one URL with apify/web-fetch and return its dataset item.
+
+        Returns None when the run does not succeed or the page answered with an
+        HTTP error. The timeout is passed to Apify too, so a stuck run is killed
+        on Apify's side instead of running to the 1-hour default.
+        """
+        run_id = await self.run_actor(
+            WEB_FETCH_ACTOR,
+            {"url": url, "formats": formats},
+            timeout_seconds=timeout_seconds,
+        )
+        status = await self.wait_for_finish(
+            run_id, poll_seconds=3, timeout_seconds=timeout_seconds + 30
+        )
+        if status != "SUCCEEDED":
+            return None
+        items = await self.get_dataset_items(run_id, limit=1)
+        item = items[0] if items else None
+        if item is None:
+            return None
+        http_status = (item.get("fetch") or {}).get("httpStatusCode")
+        if http_status is not None and int(http_status) >= 400:
+            return None
+        return item
+
+    async def fetch_html(self, url: str, *, timeout_seconds: int = 180) -> Optional[str]:
+        """Return the raw HTML of a page via apify/web-fetch, or None."""
+        item = await self.fetch_page(url, ["raw"], timeout_seconds=timeout_seconds)
+        html = (item or {}).get("raw")
+        return html if isinstance(html, str) and html.strip() else None

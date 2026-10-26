@@ -108,23 +108,19 @@ sources:
     enabled: true  # routed through Apify (see api_module) — browser scraping is blocked in prod
     api_module: scrapers.enrichers.apify_avvo
     api_class: ApifyAvvoEnricher
-    rate_limit: 5  # Apify runs per minute (bulk worker batches many profiles per run)
+    rate_limit: 5  # Apify runs per minute
     state_specific: false
     apify:
-      # fatihtahta/avvo-scraper — Avvo Scraper with Mails | US Lawyer Directory.
-      actor_id: "LfLFZ56UVZYR73Fer"
-      timeout_seconds: 1800
-      input:
-        proxyConfiguration:
-          useApifyProxy: true
-          apifyProxyGroups: ["RESIDENTIAL"]
-      # Discover mode walks Avvo listing pages (cheap apify/web-fetch runs), skips
-      # lawyers already in lawyer_enrichment and sends only new profile URLs to
-      # the paid actor. Progress per state is kept in apify_avvo_sweep.
+      # All Avvo pages (search, listing, profile) are fetched with apify/web-fetch
+      # and parsed by scrapers/enrichers/avvo.py. The fatihtahta/avvo-scraper actor
+      # was dropped in Oct 2026: Avvo blocked it and runs looped until the 1h timeout.
+      # Discover mode walks Avvo listing pages, skips lawyers already in
+      # lawyer_enrichment and fetches only new profile pages. Progress per state
+      # is kept in apify_avvo_sweep.
       discover:
         category: immigration-lawyer
         max_listing_pages_per_run: 60   # safety cap on listing-page fetches per batch
-        listing_concurrency: 5          # listing pages fetched in parallel
+        listing_concurrency: 5          # Avvo pages (listing, search, profile) fetched in parallel
         resweep_days: 30                # restart a finished state sweep after this many days
     discovery:
       strategies:

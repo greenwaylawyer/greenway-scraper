@@ -1,25 +1,36 @@
 """Apify Avvo enricher (Layer 3).
 
 API-based replacement for the browser-driven ``avvo.py`` enricher. Avvo blocks
-headless browsers in production, so we delegate the fetch to the Apify actor
-``fatihtahta/avvo-scraper`` and map its dataset records into the fields
-``merge_engine.py`` understands.
+headless browsers in production, so pages are fetched with the generic
+``apify/web-fetch`` actor and parsed with ``avvo.py``'s HTML parsers
+(search cards and profile JSON-LD + sections, including the headshot).
+
+The dedicated ``fatihtahta/avvo-scraper`` actor got blocked in Oct 2026 (runs
+looped on failed fetches until the 1h timeout). ``map_actor_item`` is kept for
+reading datasets that actor produced earlier.
 
 No browser, no FlareSolverr — just the Apify v2 HTTP API.
 """
 
 from __future__ import annotations
 
-import os
 import re
 from typing import Any, Dict, List, Optional
 
+from scrapers.enrichers.avvo import AvvoEnricher
 from scrapers.enrichers.base_enricher import BaseEnricher, DiscoveryCandidate
-from config.loader import get_source_config
 from utils.apify_client import ApifyClient, ApifyError
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_AVVO_ID_RE = re.compile(r"-(\d+)\.html")
+
+
+def avvo_id_from_url(url: Optional[str]) -> Optional[str]:
+    """Avvo's numeric lawyer ID is the trailing number of a profile URL."""
+    match = _AVVO_ID_RE.search(url or "")
+    return match.group(1) if match else None
 
 
 def _first(data: Dict[str, Any], *keys: str) -> Any:
@@ -150,35 +161,6 @@ class ApifyAvvoEnricher(BaseEnricher):
     def get_source_key(self) -> str:
         return "avvo"
 
-    def _actor_id(self) -> str:
-        config = get_source_config(self.get_source_key()) or {}
-        apify = config.get("apify", {})
-        return apify.get("actor_id") or os.getenv("APIFY_AVVO_ACTOR_ID", "")
-
-    def _input(self, extra: Dict[str, Any]) -> Dict[str, Any]:
-        config = get_source_config(self.get_source_key()) or {}
-        base = (config.get("apify") or {}).get("input") or {}
-        input_data: Dict[str, Any] = {}
-        if isinstance(base, dict):
-            input_data.update(base)
-        input_data.update(extra)
-        return input_data
-
-    async def _run_and_collect(self, input_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        actor_id = self._actor_id()
-        if not actor_id:
-            raise ApifyError("No Apify actor_id configured for apify_avvo")
-        config = get_source_config(self.get_source_key()) or {}
-        timeout = (config.get("apify") or {}).get("timeout_seconds", 1800)
-        run_id = await self.client.run_actor(actor_id, input_data)
-        logger.info("Apify Avvo run started", run_id=run_id, actor_id=actor_id)
-        status = await self.client.wait_for_finish(run_id, poll_seconds=5, timeout_seconds=timeout)
-        if status != "SUCCEEDED":
-            raise ApifyError(f"Apify Avvo run {run_id} ended with status {status}")
-        items = await self.client.get_dataset_items(run_id)
-        logger.info("Apify Avvo run finished", run_id=run_id, items=len(items))
-        return items
-
     def _build_search_url(self, lawyer: Dict[str, Any]) -> str:
         from urllib.parse import urlencode
 
@@ -193,40 +175,34 @@ class ApifyAvvoEnricher(BaseEnricher):
         )
 
     async def discover_profile(self, lawyer: Dict[str, Any]) -> List[DiscoveryCandidate]:
+        # Avvo search page via apify/web-fetch, parsed with the browser enricher's
+        # card parser. The Avvo actor got blocked (runs looped until the 1h timeout).
         search_url = self._build_search_url(lawyer)
         try:
-            items = await self._run_and_collect(self._input({"startUrls": [search_url], "limit": 10}))
+            html = await self.client.fetch_html(search_url)
         except ApifyError as exc:
-            logger.error("Apify Avvo discovery failed", error=str(exc), query=search_url)
+            logger.error("Avvo search fetch failed", error=str(exc), query=search_url)
+            return []
+        if not html:
+            logger.warning("Avvo search fetch returned no page", query=search_url)
             return []
 
-        candidates: List[DiscoveryCandidate] = []
-        for item in items:
-            mapped = map_actor_item(item)
-            url = mapped.get("source_profile_url")
-            name = mapped.get("full_name")
-            if not url or not name:
-                continue
-            address = mapped.get("address") or {}
-            location = ", ".join(filter(None, [address.get("city"), address.get("state")]))
-            candidate = DiscoveryCandidate(url=url, name=name, location=location)
+        candidates = AvvoEnricher._parse_search_cards(html)
+        for candidate in candidates:
             self.score_candidate(candidate, lawyer)
-            candidates.append(candidate)
-
         candidates.sort(key=lambda c: c.confidence, reverse=True)
         return candidates
 
     async def parse_profile(self, url: str, lawyer: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
-            items = await self._run_and_collect(self._input({"startUrls": [url], "limit": 10}))
+            html = await self.client.fetch_html(url)
         except ApifyError as exc:
-            logger.error("Apify Avvo profile fetch failed", error=str(exc), url=url)
+            logger.error("Avvo profile fetch failed", error=str(exc), url=url)
+            return None
+        if not html:
             return None
 
-        profiles = [it for it in items if it.get("type") in (None, "profile")]
-        if not profiles:
-            return None
-
-        mapped = map_actor_item(profiles[0])
-        mapped.setdefault("source_profile_url", url)
-        return mapped
+        parsed = AvvoEnricher.parse_profile_html(html, url)
+        if parsed:
+            parsed.setdefault("avvo_id", avvo_id_from_url(url))
+        return parsed
