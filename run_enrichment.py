@@ -345,9 +345,9 @@ def main():
     )
     parser.add_argument(
         '--mode',
-        choices=['enrich', 'discover'],
+        choices=['enrich', 'discover', 'refresh'],
         default='enrich',
-        help='Apify Avvo worker mode (enrich existing targets vs discover new profiles)',
+        help='Apify Avvo worker mode: enrich targets, discover new profiles, or refresh Avvo profiles missing a photo',
     )
     parser.add_argument(
         '--poll-batches',

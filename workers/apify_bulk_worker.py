@@ -1,17 +1,22 @@
 """Apify Avvo bulk enrichment worker.
 
-Two modes:
+All Avvo pages are fetched with the cheap generic ``apify/web-fetch`` actor and
+parsed with ``scrapers/enrichers/avvo.py``. The dedicated Avvo actor
+(``fatihtahta/avvo-scraper``) started getting blocked in Oct 2026: runs looped on
+failed fetches until the 1-hour timeout with 0 results. Web Fetch reads the same
+pages, and the profile page also carries the headshot the actor never returned.
 
-- ``enrich``  — pull target profiles (seeded by Google discovery) and run the
-  Apify Avvo actor over their Avvo search URLs, then match the returned
-  profiles back to the targets and merge. One actor run for the whole batch.
-- ``discover`` — paged category sweep for brand-new ``lawyer_enrichment`` rows.
-  The actor has no paging input (``searchByCategory`` + ``searchByLocation``
-  always return the same top N), so we walk Avvo's own listing pages
-  (``/immigration-lawyer/ca.html?page=N``) with the cheap ``apify/web-fetch``
-  actor, drop lawyers we already have (by Avvo ID), and send only new profile
-  URLs to the paid Avvo actor. A cursor per (category, state) in
-  ``apify_avvo_sweep`` makes the next run continue where the last one stopped.
+Modes:
+
+- ``enrich``   — targets seeded by Google discovery: fetch an Avvo search page per
+  target, pick the matching card, then fetch and merge that profile page.
+- ``discover`` — paged category sweep for brand-new ``lawyer_enrichment`` rows:
+  walk Avvo's listing pages (``/immigration-lawyer/ca.html?page=N``), drop lawyers
+  we already have (by Avvo ID), then fetch only the new profile pages. A cursor per
+  (category, state) in ``apify_avvo_sweep`` makes the next run continue where the
+  last one stopped.
+- ``refresh``  — re-read profile pages of Avvo-matched profiles that still have no
+  photo (scraped by the old actor), promoted profiles first.
 
 The worker can also poll the ``enrichment_batches`` table for rows created by
 the Filament admin ("Start Apify Avvo Run") and execute them, reporting
@@ -36,7 +41,8 @@ from dotenv import load_dotenv
 
 from config.loader import get_source_config
 from pipeline.merge_engine import merge_scraped_data
-from scrapers.enrichers.apify_avvo import map_actor_item
+from scrapers.enrichers.avvo import AvvoEnricher
+from scrapers.enrichers.base_enricher import DiscoveryCandidate
 from utils.apify_client import ApifyClient, ApifyError
 from utils.logger import get_logger
 
@@ -45,7 +51,6 @@ load_dotenv(override=True)
 
 
 AVVO_BASE = "https://www.avvo.com"
-LISTING_FETCH_ACTOR = "apify~web-fetch"
 PROFILE_URL_RE = re.compile(r"^https?://www\.avvo\.com/attorneys/[^?#]*?-(\d+)\.html")
 # Avvo IDs also appear as the trailing number of stored profile URLs.
 AVVO_ID_FROM_URL_RE = re.compile(r"-(\d+)\.html")
@@ -119,6 +124,9 @@ class ApifyBulkWorker:
             "listings_seen": 0,
             "already_known": 0,
             "new_profiles_queued": 0,
+            "profile_fetch_failed": 0,
+            # refresh mode
+            "photos_found": 0,
         }
 
     def _conn(self):
@@ -170,60 +178,46 @@ class ApifyBulkWorker:
     def _config(self) -> Dict[str, Any]:
         return get_source_config(self.source_key) or {}
 
-    def _actor_id(self) -> str:
-        apify = self._config().get("apify", {})
-        return apify.get("actor_id") or os.getenv("APIFY_AVVO_ACTOR_ID", "")
+    def _concurrency(self) -> int:
+        return max(1, int(self._discover_config().get("listing_concurrency", 5)))
 
-    def _input(self, extra: Dict[str, Any]) -> Dict[str, Any]:
-        base = self._config().get("apify", {}).get("input") or {}
-        input_data: Dict[str, Any] = {}
-        if isinstance(base, dict):
-            input_data.update(base)
-        input_data.update(extra)
-        return input_data
+    async def _fetch_html(self, url: str) -> Optional[str]:
+        """Raw HTML of one Avvo page via apify/web-fetch; None when it fails."""
+        try:
+            return await self.client.fetch_html(url)
+        except ApifyError as exc:
+            logger.warning("Avvo page fetch failed", url=url, error=str(exc))
+            return None
 
-    async def _run_actor(
-        self,
-        input_data: Dict[str, Any],
-        on_status: Optional[Any] = None,
-    ) -> List[Dict[str, Any]]:
-        actor_id = self._actor_id()
-        if not actor_id:
-            raise ApifyError("No Apify actor_id configured for apify_avvo")
-        timeout = self._config().get("apify", {}).get("timeout_seconds", 1800)
-        run_id = await self.client.run_actor(actor_id, input_data)
-        logger.info("Apify Avvo run started", run_id=run_id, mode=self.mode)
+    async def _gather_limited(self, coros: List[Any]) -> List[Any]:
+        """Run coroutines with at most `listing_concurrency` in flight."""
+        semaphore = asyncio.Semaphore(self._concurrency())
 
-        async def _report(status: str) -> None:
-            callback = on_status or self._on_apify_status
-            if callback is not None:
-                await callback(status)
+        async def _run(coro):
+            async with semaphore:
+                return await coro
 
-        status = await self.client.wait_for_finish(
-            run_id, poll_seconds=5, timeout_seconds=timeout, on_status=_report
-        )
-        if status != "SUCCEEDED":
-            raise ApifyError(f"Apify Avvo run {run_id} ended with status {status}")
-        items = await self._collect_all_items(run_id)
-        logger.info("Apify Avvo run finished", run_id=run_id, items=len(items))
-        return items
+        return await asyncio.gather(*(_run(c) for c in coros))
 
-    async def _collect_all_items(self, run_id: str) -> List[Dict[str, Any]]:
-        items: List[Dict[str, Any]] = []
-        offset = 0
-        while True:
-            page = await self.client.get_dataset_items(run_id, offset=offset, limit=1000)
-            if not page:
-                break
-            items.extend(page)
-            offset += len(page)
-            if len(page) < 1000:
-                break
-        return items
+    async def _fetch_profiles(self, urls: List[str]) -> List[Dict[str, Any]]:
+        """Fetch and parse Avvo profile pages; returns parsed profiles (failures skipped)."""
+        done = 0
 
-    @staticmethod
-    def _profile_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [it for it in items if it.get("type") in (None, "profile")]
+        async def _one(url: str) -> Optional[Dict[str, Any]]:
+            nonlocal done
+            html = await self._fetch_html(url)
+            parsed = AvvoEnricher.parse_profile_html(html, url) if html else None
+            if parsed:
+                parsed.setdefault("avvo_id", avvo_id_from_url(url))
+            else:
+                self.stats["profile_fetch_failed"] += 1
+            done += 1
+            if self._on_apify_status is not None:
+                await self._on_apify_status(f"PROFILES {done}/{len(urls)}")
+            return parsed
+
+        results = await self._gather_limited([_one(u) for u in urls])
+        return [r for r in results if r]
 
     # ── enrich mode ──────────────────────────────────────────────────────────
 
@@ -311,38 +305,27 @@ class ApifyBulkWorker:
             score += 0.05
         return min(score, 1.0)
 
-    def _match(self, targets: List[Dict[str, Any]], items: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
-        sigs = [self._target_signature(t) for t in targets]
-        by_state: Dict[str, List[int]] = {}
-        for idx, sig in enumerate(sigs):
-            by_state.setdefault(sig["state"] or "_", []).append(idx)
-
-        used: set = set()
-        matches: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-
-        for item in items:
-            mapped = map_actor_item(item)
-            if not mapped.get("full_name"):
+    def _pick_candidate(
+        self,
+        target: Dict[str, Any],
+        candidates: List[DiscoveryCandidate],
+        taken: set,
+    ) -> Optional[DiscoveryCandidate]:
+        """Best search card for this target (score >= 0.85), skipping profiles already claimed."""
+        t_sig = self._target_signature(target)
+        best, best_score = None, 0.0
+        for cand in candidates:
+            if cand.url in taken:
                 continue
-            i_sig = self._item_signature(mapped)
-            candidates = by_state.get(i_sig["state"] or "_", []) or list(range(len(targets)))
-
-            best_idx, best_score = None, 0.0
-            for idx in candidates:
-                if idx in used:
-                    continue
-                score = self._score(sigs[idx], i_sig)
-                if score > best_score:
-                    best_score, best_idx = score, idx
-
-            if best_idx is not None and best_score >= 0.85:
-                used.add(best_idx)
-                matches.append((targets[best_idx], mapped))
-
-        self.stats["items"] = len(items)
-        self.stats["matched"] = len(matches)
-        self.stats["unmatched"] = len(items) - len(matches)
-        return matches
+            city, _, state = (cand.location or "").partition(",")
+            c_sig = self._item_signature({
+                "full_name": cand.name,
+                "address": {"city": city.strip(), "state": state.strip()},
+            })
+            score = self._score(t_sig, c_sig)
+            if score > best_score:
+                best, best_score = cand, score
+        return best if best is not None and best_score >= 0.85 else None
 
     # ── persist ──────────────────────────────────────────────────────────────
 
@@ -527,11 +510,31 @@ class ApifyBulkWorker:
             logger.info("No targets selected for Apify Avvo enrich")
             return self.stats
 
-        urls = [self._build_search_url(t) for t in targets]
-        self.stats["queries"] = len(urls)
-        items = await self._run_actor(self._input({"startUrls": urls, "limit": 10}))
-        profiles = self._profile_items(items)
-        matches = self._match(targets, profiles)
+        # 1. One Avvo search page per target, 2. pick the matching card,
+        # 3. fetch only the matched profile pages.
+        search_urls = [self._build_search_url(t) for t in targets]
+        self.stats["queries"] = len(search_urls)
+        pages = await self._gather_limited([self._fetch_html(u) for u in search_urls])
+
+        taken: set = set()
+        chosen: List[Tuple[Dict[str, Any], str]] = []
+        for target, html in zip(targets, pages):
+            if not html:
+                self.stats["errors"] += 1
+                continue
+            cards = AvvoEnricher._parse_search_cards(html)
+            self.stats["items"] += len(cards)
+            pick = self._pick_candidate(target, cards, taken)
+            if pick is None:
+                self.stats["unmatched"] += 1
+                continue
+            taken.add(pick.url)
+            chosen.append((target, pick.url))
+
+        profiles = await self._fetch_profiles([url for _, url in chosen])
+        by_url = {p.get("source_profile_url"): p for p in profiles}
+        matches = [(t, by_url[u]) for t, u in chosen if u in by_url]
+        self.stats["matched"] = len(matches)
 
         if self.dry_run:
             logger.info("Dry run — matched profiles", matched=len(matches))
@@ -543,6 +546,74 @@ class ApifyBulkWorker:
                 self.stats["merged"] += 1
             except Exception as exc:
                 logger.warning("Failed to persist Apify Avvo profile", profile_id=target.get("id"), error=str(exc))
+                self.stats["errors"] += 1
+        return self.stats
+
+    # ── refresh mode ────────────────────────────────────────────────────────
+
+    def select_refresh_targets(self) -> List[Dict[str, Any]]:
+        """Avvo-matched profiles still missing a photo, promoted ones first.
+
+        These were scraped by the old Avvo actor, which never returned photos;
+        re-reading their profile page fills photo_url and the richer page fields.
+        """
+        conn = self._conn()
+        query = """
+            SELECT * FROM (
+                SELECT le.id, le.full_name, le.first_name, le.last_name,
+                       le.city, le.state, le.license_state, le.bar_number,
+                       le.merged_data, le.manually_curated_fields, le.promoted_at,
+                       COALESCE(
+                           esr.source_profile_url,
+                           le.raw_data_by_source->'avvo'->>'source_url',
+                           le.raw_data_by_source->'avvo'->'data'->>'source_profile_url'
+                       ) AS avvo_url
+                FROM lawyer_enrichment le
+                LEFT JOIN enrichment_source_requests esr
+                       ON esr.lawyer_enrichment_id = le.id AND esr.source_key = %s
+                WHERE COALESCE(le.merged_data->>'photo_url', '') NOT LIKE 'http%%'
+            ) t
+            WHERE t.avvo_url LIKE 'https://www.avvo.com/attorneys/%%'
+            ORDER BY (t.promoted_at IS NULL), t.id
+            LIMIT %s
+        """
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(query, (self.source_key, self.batch_size))
+                return [dict(r) for r in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    async def _run_refresh(self) -> Dict[str, Any]:
+        targets = self.select_refresh_targets()
+        if self.limit is not None and self.limit > 0:
+            targets = targets[: self.limit]
+        self.stats["selected"] = len(targets)
+        self.stats["queries"] = len(targets)
+        if not targets:
+            logger.info("No Avvo profiles need a refresh")
+            return self.stats
+
+        if self.dry_run:
+            logger.info("Dry run — profiles to refresh", count=len(targets),
+                        sample=[t["avvo_url"] for t in targets[:5]])
+            return self.stats
+
+        profiles = await self._fetch_profiles([t["avvo_url"] for t in targets])
+        by_url = {p.get("source_profile_url"): p for p in profiles}
+        self.stats["items"] = len(profiles)
+
+        for target in targets:
+            mapped = by_url.get(target["avvo_url"])
+            if not mapped:
+                continue
+            try:
+                self._persist_match(target, mapped)
+                self.stats["merged"] += 1
+                if mapped.get("photo_url"):
+                    self.stats["photos_found"] += 1
+            except Exception as exc:
+                logger.warning("Failed to persist refreshed Avvo profile", profile_id=target.get("id"), error=str(exc))
                 self.stats["errors"] += 1
         return self.stats
 
@@ -672,16 +743,13 @@ class ApifyBulkWorker:
     async def _fetch_listing(self, url: str) -> Optional[Dict[str, Any]]:
         """Fetch one Avvo listing page via apify/web-fetch; None when it fails."""
         try:
-            run_id = await self.client.run_actor(LISTING_FETCH_ACTOR, {"url": url, "formats": ["links"]})
-            status = await self.client.wait_for_finish(run_id, poll_seconds=3, timeout_seconds=180)
-            if status != "SUCCEEDED":
-                logger.warning("Listing fetch failed", url=url, status=status)
-                return None
-            items = await self.client.get_dataset_items(run_id, limit=1)
+            item = await self.client.fetch_page(url, ["links"])
         except ApifyError as exc:
             logger.warning("Listing fetch failed", url=url, error=str(exc))
             return None
-        return items[0] if items else None
+        if item is None:
+            logger.warning("Listing fetch failed", url=url)
+        return item
 
     async def _collect_new_profile_urls(self, category: str, states: List[str], budget: int) -> List[str]:
         """Walk listing pages from each state's cursor until `budget` new profile URLs are found.
@@ -778,14 +846,12 @@ class ApifyBulkWorker:
             logger.info("Dry run — new profile URLs", count=len(profile_urls), sample=profile_urls[:5])
             return self.stats
 
-        # The actor's limit is per query and must be >= 10; a profile URL yields one item.
-        items = await self._run_actor(self._input({"startUrls": profile_urls, "limit": 10}))
-        profile_items = self._profile_items(items)
-        self.stats["items"] = len(profile_items)
+        profiles = await self._fetch_profiles(profile_urls)
+        self.stats["items"] = len(profiles)
 
-        for item in profile_items:
+        for mapped in profiles:
             try:
-                self._insert_discovered(map_actor_item(item))
+                self._insert_discovered(mapped)
                 self.stats["inserted"] += 1
             except Exception as exc:
                 logger.warning("Failed to insert discovered profile", error=str(exc))
@@ -795,6 +861,8 @@ class ApifyBulkWorker:
     async def run(self) -> Dict[str, Any]:
         if self.mode == "discover":
             return await self._run_discover()
+        if self.mode == "refresh":
+            return await self._run_refresh()
         return await self._run_enrich()
 
     # ── batch (Filament-triggered) orchestration ─────────────────────────────
