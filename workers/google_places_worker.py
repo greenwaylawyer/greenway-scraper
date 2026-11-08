@@ -388,27 +388,18 @@ class GooglePlacesWorker:
             return
         
         # Discovery phase
-        merged_data = profile.get('merged_data', {})
-        address_data = merged_data.get('address', {})
-        
-        # Build address string from merged_data->address if available
-        address_str = None
-        if isinstance(address_data, dict):
-            addr_parts = [
-                address_data.get('line1', ''),
-                address_data.get('city', ''),
-                address_data.get('state', ''),
-            ]
-            address_str = ', '.join(p for p in addr_parts if p)
+        merged_data = profile.get('merged_data') or {}
+        address_data = merged_data.get('address') or {}
+        address_str = (address_data.get('line1') or '').strip() if isinstance(address_data, dict) else ''
         
         lawyer_data = {
-            'full_name': profile['full_name'],
-            'first_name': profile['first_name'],
-            'last_name': profile['last_name'],
-            'firm_name': profile.get('firm_name'),
-            'city': profile.get('city'),
-            'state': profile.get('address_state') or profile.get('license_state'),
-            'address': address_str or '',
+            'full_name': profile['full_name'] or merged_data.get('full_name'),
+            'first_name': profile['first_name'] or merged_data.get('first_name'),
+            'last_name': profile['last_name'] or merged_data.get('last_name'),
+            'firm_name': profile.get('firm_name') or merged_data.get('firm_name'),
+            'city': profile.get('city') or (address_data.get('city') if isinstance(address_data, dict) else None),
+            'state': profile.get('address_state') or profile.get('license_state') or (address_data.get('state') if isinstance(address_data, dict) else None),
+            'address': address_str,
             'phone': merged_data.get('phone'),
         }
         
@@ -421,8 +412,25 @@ class GooglePlacesWorker:
             self.stats['skipped'] += 1
             return
         
-        # Take best candidate
+        # Take best candidate if it meets confidence threshold or is a single strong match
         best = candidates[0]
+        threshold = float((self.config.get('discovery') or {}).get('confidence_threshold', 0.60))
+        has_strong_signal = any(
+            s in ('name_match', 'firm_name_match') or s.startswith('address_match')
+            for s in (best.match_signals or [])
+        )
+        single_strong = len(candidates) == 1 and best.confidence >= 0.45 and has_strong_signal
+
+        if best.confidence < threshold and not single_strong:
+            logger.info(
+                f"Google Maps candidates require admin review for {profile['full_name']}",
+                count=len(candidates),
+                best_confidence=best.confidence,
+            )
+            await self._update_request_candidates(profile, [c.to_dict() for c in candidates])
+            self.stats['skipped'] += 1
+            return
+
         logger.info(
             f"Found Google Maps listing for {profile['full_name']}",
             confidence=best.confidence,
@@ -507,6 +515,34 @@ class GooglePlacesWorker:
                     WHERE lawyer_enrichment_id = %s AND source_key = %s
                     """,
                     (place_id, place_id, confidence, profile['lawyer_enrichment_id'], self.source_key),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+    async def _update_request_candidates(
+        self,
+        profile: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+    ):
+        """Mark request as needing admin candidate review."""
+        conn = self._get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE enrichment_source_requests
+                    SET discovery_status = 'candidates',
+                        discovery_candidates = %s,
+                        discovery_completed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE lawyer_enrichment_id = %s AND source_key = %s
+                    """,
+                    (
+                        psycopg2.extras.Json(candidates),
+                        profile['lawyer_enrichment_id'],
+                        self.source_key,
+                    ),
                 )
                 conn.commit()
         finally:

@@ -10,7 +10,13 @@ import re
 import aiohttp
 from urllib.parse import urlparse, parse_qs, unquote
 
-from scrapers.enrichers.base_enricher import BaseEnricher, DiscoveryCandidate
+from scrapers.enrichers.base_enricher import (
+    BaseEnricher,
+    DiscoveryCandidate,
+    GENERIC_FIRM_WORDS,
+    NAME_PREFIXES,
+    NAME_SUFFIXES,
+)
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -76,6 +82,165 @@ class GooglePlacesEnricher(BaseEnricher):
         # Not a recognizable place_id format
         return None
 
+    @classmethod
+    def _build_search_queries(cls, lawyer: Dict[str, Any]) -> List[str]:
+        """
+        Build Google Places Find Place search queries without wrapping names in exact-phrase
+        double quotes (which causes multi-word/middle-name bar names to fail and fall back
+        to generic city-wide attorney results).
+        """
+        identity = cls.extract_lawyer_identity(lawyer)
+        loc_parts = [p for p in [lawyer.get('city'), identity['state_code'].upper() if identity['state_code'] else None] if p]
+        loc_str = ' '.join(loc_parts)
+
+        queries: List[str] = []
+
+        if identity['full_name']:
+            parts = [
+                identity['full_name'],
+                identity['firm_name'] or None,
+                loc_str or None,
+                'attorney',
+            ]
+            queries.append(' '.join(p for p in parts if p))
+
+        # Fallback query with "First Last" when full_name has 3+ tokens (middle/maiden names)
+        first_token = identity['first_token']
+        last_token = identity['last_token']
+        if first_token and last_token and first_token != last_token and len(identity['all_name_tokens']) >= 3:
+            short_name = f"{first_token.capitalize()} {last_token.capitalize()}"
+            parts = [short_name, loc_str or None, 'attorney']
+            q = ' '.join(p for p in parts if p)
+            if q not in queries:
+                queries.append(q)
+
+        # Fallback query with firm_name if available
+        if identity['firm_name'] and identity['firm_tokens']:
+            parts = [identity['firm_name'], loc_str or None, 'attorney']
+            q = ' '.join(p for p in parts if p)
+            if q not in queries:
+                queries.append(q)
+
+        return queries
+
+    def _score_place_candidate(
+        self,
+        place: Dict[str, Any],
+        lawyer: Dict[str, Any],
+    ) -> Optional[DiscoveryCandidate]:
+        """
+        Score and validate a Google Places candidate.
+        Returns None if the candidate fails the identity gate (e.g. only matches city/state).
+        """
+        place_id = place.get('place_id')
+        name = (place.get('name') or '').strip()
+        formatted_address = (place.get('formatted_address') or '').strip()
+
+        if not place_id or not name:
+            return None
+
+        identity = self.extract_lawyer_identity(lawyer)
+
+        # Extract street line1 ONLY (never city/state alone)
+        raw_addr = lawyer.get('address', '')
+        if isinstance(raw_addr, dict):
+            lawyer_line1 = (raw_addr.get('line1') or '').strip()
+        else:
+            lawyer_line1 = (raw_addr or '').strip()
+
+        confidence = 0.0
+        signals: List[str] = []
+        has_identity_match = False
+
+        # 1. Street address (line1) match (+0.50)
+        if self.is_valid_street_address(lawyer_line1) and formatted_address:
+            addr_similarity = self.compare_addresses(lawyer_line1, formatted_address)
+            if addr_similarity >= 0.5:
+                confidence += 0.50
+                signals.append(f'address_match_{int(round(addr_similarity * 100))}')
+                has_identity_match = True
+
+        # 2. Lawyer name / firm name match against place name
+        cand_tokens = self.parse_person_name_tokens(name)
+        cand_all_words = self.word_tokens(name)
+        cand_sig_words = [
+            w for w in cand_all_words
+            if w not in GENERIC_FIRM_WORDS and w not in NAME_PREFIXES and w not in NAME_SUFFIXES
+        ]
+
+        first_token = identity['first_token']
+        last_token = identity['last_token']
+
+        has_first_and_last = bool(
+            first_token
+            and last_token
+            and first_token in cand_tokens
+            and last_token in cand_tokens
+        )
+
+        if has_first_and_last:
+            confidence += 0.45
+            signals.append('name_match')
+            has_identity_match = True
+
+        # Firm name match (+0.45, or +0.15 bonus if name_match also matched)
+        firm_tokens = identity['firm_tokens']
+        if firm_tokens and cand_sig_words:
+            overlap = [t for t in firm_tokens if t in cand_sig_words]
+            ratio = len(overlap) / len(firm_tokens)
+            primary_firm_word = firm_tokens[0]
+            if ratio >= 0.60 and primary_firm_word in cand_sig_words:
+                confidence += 0.15 if has_first_and_last else 0.45
+                signals.append('firm_name_match')
+                has_identity_match = True
+
+        # Last name match in a firm/practice listing (+0.30) when full first+last didn't match
+        if not has_first_and_last and last_token and len(last_token) >= 3:
+            if last_token in cand_sig_words:
+                is_multi_partner = ('&' in name) or ('and' in cand_all_words)
+                allowed_words = set(
+                    identity['all_name_tokens']
+                    + identity['surname_tokens']
+                    + firm_tokens
+                    + ([first_token[0]] if first_token else [])
+                )
+                foreign_words = [w for w in cand_sig_words if w not in allowed_words]
+                if not foreign_words or is_multi_partner:
+                    confidence += 0.30
+                    signals.append('last_name_match')
+                    has_identity_match = True
+
+        # IDENTITY GATE: Reject candidates that only match city/state with zero identity match
+        if not has_identity_match:
+            return None
+
+        # 3. Corroborating Location Signals (+0.10 city, +0.10 state)
+        if identity['city'] and self.contains_phrase(formatted_address, identity['city']):
+            confidence += 0.10
+            signals.append('city_in_address')
+
+        if self.location_matches_state(formatted_address, identity['state_code'], identity['state_name']):
+            confidence += 0.10
+            signals.append('state_in_address')
+
+        confidence = min(1.0, round(confidence, 2))
+
+        candidate = DiscoveryCandidate(
+            url=place_id,  # For Google Places, "url" stores the place_id
+            name=name,
+            location=formatted_address,
+            bar_number=None,
+            confidence=confidence,
+            match_signals=signals,
+        )
+
+        geometry = place.get('geometry') or {}
+        location = geometry.get('location') or {}
+        if location.get('lat') and location.get('lng'):
+            candidate.match_signals.append(f"geo:{location['lat']},{location['lng']}")
+
+        return candidate
+
     async def discover_profile(
         self,
         lawyer: Dict[str, Any],
@@ -97,144 +262,73 @@ class GooglePlacesEnricher(BaseEnricher):
         if not self.api_key:
             logger.error("Cannot discover without GOOGLE_PLACES_API_KEY")
             return []
-        
-        candidates = []
-        
-        # Build search query: "Full Name" "Firm Name" City State attorney
-        query_parts = []
-        if lawyer.get('full_name'):
-            query_parts.append(f'"{lawyer["full_name"]}"')
-        if lawyer.get('firm_name'):
-            query_parts.append(f'"{lawyer["firm_name"]}"')
-        if lawyer.get('city'):
-            query_parts.append(lawyer['city'])
-        if lawyer.get('state') or lawyer.get('license_state'):
-            query_parts.append(lawyer.get('state') or lawyer.get('license_state'))
-        query_parts.append('attorney')
-        
-        query = ' '.join(query_parts)
-        
-        logger.info("Google Places discovery search", query=query, lawyer=lawyer.get('full_name'))
-        
-        # Make API call
+
+        queries = self._build_search_queries(lawyer)
+        if not queries:
+            return []
+
+        candidates: List[DiscoveryCandidate] = []
+        seen_place_ids = set()
+
         try:
             async with aiohttp.ClientSession() as session:
-                params = {
-                    'input': query,
-                    'inputtype': 'textquery',
-                    'fields': self.FIND_PLACE_FIELDS,
-                    'key': self.api_key,
-                }
-                
-                async with session.get(self.FIND_PLACE_URL, params=params) as resp:
-                    if resp.status != 200:
-                        logger.error("Find Place API error", status=resp.status, text=await resp.text())
-                        return []
-                    
-                    data = await resp.json()
-                    
-                    if data.get('status') not in ['OK', 'ZERO_RESULTS']:
-                        logger.error("Find Place API bad status", status=data.get('status'), 
-                                   error=data.get('error_message'))
-                        return []
-                    
-                    if data.get('status') == 'ZERO_RESULTS':
-                        logger.info("No Google Places results found", query=query)
-                        return []
-                    
-                    # Parse candidates (usually just 1)
-                    for place in data.get('candidates', []):
-                        place_id = place.get('place_id')
-                        if not place_id:
+                for query in queries:
+                    logger.info("Google Places discovery search", query=query, lawyer=lawyer.get('full_name'))
+                    params = {
+                        'input': query,
+                        'inputtype': 'textquery',
+                        'fields': self.FIND_PLACE_FIELDS,
+                        'key': self.api_key,
+                    }
+
+                    async with session.get(self.FIND_PLACE_URL, params=params) as resp:
+                        if resp.status != 200:
+                            logger.error("Find Place API error", status=resp.status, text=await resp.text())
                             continue
-                        
-                        name = place.get('name', '')
-                        formatted_address = place.get('formatted_address', '')
-                        geometry = place.get('geometry', {})
-                        location = geometry.get('location', {})
-                        
-                        # Extract city/state from formatted_address
-                        # Example: "123 Main St, Los Angeles, CA 90001, USA"
-                        location_str = formatted_address
-                        
-                        # Score candidate
-                        confidence = 0.0
-                        signals = []
-                        
-                        # Address match (+0.50)
-                        lawyer_address = lawyer.get('address', '')
-                        if isinstance(lawyer_address, dict):
-                            # merged_data format
-                            addr_parts = [
-                                lawyer_address.get('line1', ''),
-                                lawyer_address.get('city', ''),
-                                lawyer_address.get('state', ''),
-                            ]
-                            lawyer_address = ', '.join(p for p in addr_parts if p)
-                        
-                        if lawyer_address and formatted_address:
-                            addr_similarity = self.compare_addresses(lawyer_address, formatted_address)
-                            if addr_similarity >= 0.5:
-                                confidence += 0.50
-                                signals.append(f'address_match_{int(addr_similarity * 100)}')
-                        # Phone matching is deferred to place/details (findplacefromtext doesn't return phone)
-                        
-                        # Name similarity (+0.15)
-                        lawyer_name = lawyer.get('full_name', '')
-                        if lawyer_name and name:
-                            from difflib import SequenceMatcher
-                            lower_lawyer = lawyer_name.lower().strip()
-                            lower_name = name.lower()
-                            if lower_lawyer and lower_lawyer in lower_name:
-                                confidence += 0.15
-                                signals.append('name_contains')
-                            else:
-                                name_sim = SequenceMatcher(None, lower_lawyer, lower_name).ratio()
-                                if name_sim >= 0.6:
-                                    confidence += 0.15 * (name_sim / 0.6)  # Scale: 0.6->0.15, 1.0->0.25
-                                    signals.append(f'name_similarity_{int(name_sim * 100)}')
 
-                        # City/state presence in formatted_address (+0.20)
-                        target_city = (lawyer.get('city') or '').lower()
-                        target_state = (lawyer.get('state') or lawyer.get('license_state') or '').lower()
-                        addr_lower = (formatted_address or '').lower()
-                        if target_city and target_city in addr_lower:
-                            confidence += 0.10
-                            signals.append('city_in_address')
-                        if target_state and target_state in addr_lower:
-                            confidence += 0.10
-                            signals.append('state_in_address')
+                        data = await resp.json()
 
-                        confidence = min(1.0, confidence)
-                        
-                        candidate = DiscoveryCandidate(
-                            url=place_id,  # For Google Places, "url" stores the place_id
-                            name=name,
-                            location=location_str,
-                            bar_number=None,  # Google doesn't show bar numbers
-                            confidence=confidence,
-                            match_signals=signals,
-                        )
-                        
-                        # Store lat/lng in match_signals for later use
-                        if location.get('lat') and location.get('lng'):
-                            candidate.match_signals.append(f"geo:{location['lat']},{location['lng']}")
-                        
-                        candidates.append(candidate)
-                        
-                        logger.info("Google Places candidate found", 
-                                  place_id=place_id, 
-                                  name=name,
-                                  confidence=confidence,
-                                  signals=signals)
-        
+                        if data.get('status') not in ['OK', 'ZERO_RESULTS']:
+                            logger.error(
+                                "Find Place API bad status",
+                                status=data.get('status'),
+                                error=data.get('error_message'),
+                            )
+                            continue
+
+                        if data.get('status') == 'ZERO_RESULTS':
+                            logger.info("No Google Places results found", query=query)
+                            continue
+
+                        for place in data.get('candidates', []):
+                            place_id = place.get('place_id')
+                            if not place_id or place_id in seen_place_ids:
+                                continue
+
+                            candidate = self._score_place_candidate(place, lawyer)
+                            if candidate is None:
+                                continue
+
+                            seen_place_ids.add(place_id)
+                            candidates.append(candidate)
+
+                            logger.info(
+                                "Google Places candidate found",
+                                place_id=place_id,
+                                name=candidate.name,
+                                confidence=candidate.confidence,
+                                signals=candidate.match_signals,
+                            )
+
+                        # Stop trying fallback queries once we found at least one valid candidate
+                        if candidates:
+                            break
+
         except Exception as e:
-            logger.error("Google Places discovery failed", error=str(e), query=query)
+            logger.error("Google Places discovery failed", error=str(e), lawyer=lawyer.get('full_name'))
             return []
-        
-        # Sort by confidence descending
+
         candidates.sort(key=lambda c: c.confidence, reverse=True)
-        
         return candidates
 
     async def parse_profile(
@@ -379,55 +473,16 @@ class GooglePlacesEnricher(BaseEnricher):
         Returns:
             ChIJ format place_id or None
         """
-        # Build search query from lawyer data
-        query_parts = []
-        if lawyer.get('full_name'):
-            query_parts.append(f'"{lawyer["full_name"]}"')
-        if lawyer.get('firm_name'):
-            query_parts.append(f'"{lawyer["firm_name"]}"')
-        if lawyer.get('city'):
-            query_parts.append(lawyer['city'])
-        if lawyer.get('state') or lawyer.get('license_state'):
-            query_parts.append(lawyer.get('state') or lawyer.get('license_state'))
-        query_parts.append('attorney')
-        
-        query = ' '.join(query_parts)
-        
-        logger.info("Converting place ID via search", raw_id=raw_id, query=query)
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                params = {
-                    'input': query,
-                    'inputtype': 'textquery',
-                    'fields': 'place_id,name',
-                    'key': self.api_key,
-                }
-                
-                async with session.get(self.FIND_PLACE_URL, params=params) as resp:
-                    if resp.status != 200:
-                        logger.error("Find Place API error during conversion", status=resp.status)
-                        return None
-                    
-                    data = await resp.json()
-                    
-                    if data.get('status') != 'OK':
-                        logger.error("Find Place API bad status during conversion", status=data.get('status'))
-                        return None
-                    
-                    candidates = data.get('candidates', [])
-                    if not candidates:
-                        logger.warning("No candidates found during ID conversion")
-                        return None
-                    
-                    # Return the first candidate's place_id
-                    converted_id = candidates[0].get('place_id')
-                    logger.info("Successfully converted place ID", 
-                              original=raw_id, 
-                              converted=converted_id,
-                              name=candidates[0].get('name'))
-                    return converted_id
-        
-        except Exception as e:
-            logger.error("Failed to convert place ID", error=str(e), raw_id=raw_id)
+        candidates = await self.discover_profile(lawyer)
+        if not candidates:
+            logger.warning("No validated candidates found during ID conversion", raw_id=raw_id)
             return None
+
+        converted_id = candidates[0].url
+        logger.info(
+            "Successfully converted place ID",
+            original=raw_id,
+            converted=converted_id,
+            name=candidates[0].name,
+        )
+        return converted_id

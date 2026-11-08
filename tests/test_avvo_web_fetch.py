@@ -148,11 +148,19 @@ def make_enricher(pages):
 
 
 async def test_enricher_discover_profile_ranks_matching_card_first():
-    enricher = make_enricher({"search": SEARCH_HTML})
+    search_with_partial = (
+        "<html><body>"
+        + search_card("Janet Other", "Miami", "FL", "https://www.avvo.com/attorneys/33101-fl-janet-other-7654321.html")
+        + search_card("Jane Sample", "Miami", "FL", "https://www.avvo.com/attorneys/33101-fl-jane-sample-9999999.html")
+        + search_card("Jane Sample", "Orlando", "FL", PROFILE_URL)
+        + "</body></html>"
+    )
+    enricher = make_enricher({"search": search_with_partial})
     lawyer = {"full_name": "Jane Sample", "first_name": "Jane", "last_name": "Sample", "city": "Orlando", "state": "FL"}
 
     candidates = await enricher.discover_profile(lawyer)
 
+    assert len(candidates) == 2  # unrelated "Janet Other" filtered out by identity gate
     assert candidates[0].url == PROFILE_URL
     assert candidates[0].confidence > candidates[1].confidence
 

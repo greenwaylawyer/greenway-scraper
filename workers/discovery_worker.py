@@ -199,25 +199,23 @@ class DiscoveryWorker:
             # Run discovery
             merged_data = request.get('merged_data') or {}
             addr = merged_data.get('address') or {}
-            address_str = ''
-            if isinstance(addr, dict):
-                parts = [addr.get('line1'), addr.get('line2'), addr.get('city'), addr.get('state'), addr.get('zip')]
-                address_str = ', '.join([p for p in parts if p])
+            address_str = (addr.get('line1') or '').strip() if isinstance(addr, dict) else ''
 
             lawyer_data = {
-                'full_name': request['full_name'],
-                'first_name': request['first_name'],
-                'last_name': request['last_name'],
-                'bar_number': request.get('bar_number'),
-                'state': request.get('state'),
+                'full_name': request['full_name'] or merged_data.get('full_name'),
+                'first_name': request['first_name'] or merged_data.get('first_name'),
+                'last_name': request['last_name'] or merged_data.get('last_name'),
+                'bar_number': request.get('bar_number') or merged_data.get('bar_number'),
+                'state': request.get('state') or (addr.get('state') if isinstance(addr, dict) else None),
                 'license_state': request.get('state'),
-                'city': request.get('city'),
-                'firm_name': request.get('firm_name'),
+                'city': request.get('city') or (addr.get('city') if isinstance(addr, dict) else None),
+                'firm_name': request.get('firm_name') or merged_data.get('firm_name'),
                 'phone': merged_data.get('phone'),
                 'address': address_str,
             }
             
             candidates = await enricher.discover_profile(lawyer_data)
+            candidates = [c for c in candidates if c.confidence > 0]
             
             # Get confidence threshold for this source
             threshold = get_confidence_threshold(source_key)
@@ -250,10 +248,13 @@ class DiscoveryWorker:
                 )
                 return True
 
-            # Google Maps is often a single clear candidate even with low confidence
-            # (street address/phone may be missing in our base profile). If there's only
-            # one candidate, auto-select it and proceed to Layer 4 scraping.
-            if source_key == 'google_maps' and len(candidates) == 1 and best.url:
+            # Google Maps single candidate: only auto-select if it has a strong identity match
+            # (name_match, firm_name_match, or address_match => confidence >= 0.45).
+            has_strong_signal = any(
+                s in ('name_match', 'firm_name_match') or s.startswith('address_match')
+                for s in (best.match_signals or [])
+            )
+            if source_key == 'google_maps' and len(candidates) == 1 and best.url and best.confidence >= 0.45 and has_strong_signal:
                 await self._update_request_found(
                     request_id,
                     best.url,

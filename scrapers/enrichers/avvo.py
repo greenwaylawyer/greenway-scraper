@@ -232,9 +232,18 @@ class AvvoEnricher(BaseEnricher):
         lawyer: Dict[str, Any],
     ) -> List[DiscoveryCandidate]:
         """Search Avvo for matching lawyer profile."""
-        full_name   = lawyer.get("full_name") or ""
+        identity    = self.extract_lawyer_identity(lawyer)
+        full_name   = identity["full_name"]
         city        = (lawyer.get("city") or "").strip()
         state_code  = (lawyer.get("license_state") or lawyer.get("state") or "").strip()
+
+        name_variants: List[str] = [full_name] if full_name else []
+        first_token = identity["first_token"]
+        last_token  = identity["last_token"]
+        if first_token and last_token and first_token != last_token and len(identity["all_name_tokens"]) >= 3:
+            short_name = f"{first_token.capitalize()} {last_token.capitalize()}"
+            if short_name not in name_variants:
+                name_variants.append(short_name)
 
         # Try several location filters for robustness
         locations: List[str] = []
@@ -248,33 +257,33 @@ class AvvoEnricher(BaseEnricher):
 
         candidates_map: Dict[str, DiscoveryCandidate] = {}
 
-        for loc in locations:
-            search_url = self._build_search_url(full_name, loc)
-            logger.info("Avvo discovery search",
-                        url=search_url, lawyer=full_name, location=loc or "(none)")
-            try:
-                html = await self._fetch_html(search_url)
-            except Exception as e:
-                logger.error("Avvo search fetch failed", url=search_url, error=str(e))
-                continue
+        for query_name in name_variants:
+            for loc in locations:
+                search_url = self._build_search_url(query_name, loc)
+                logger.info("Avvo discovery search",
+                            url=search_url, lawyer=query_name, location=loc or "(none)")
+                try:
+                    html = await self._fetch_html(search_url)
+                except Exception as e:
+                    logger.error("Avvo search fetch failed", url=search_url, error=str(e))
+                    continue
 
-            for c in self._parse_search_cards(html):
-                if c.url not in candidates_map:
-                    candidates_map[c.url] = c
+                for c in self._parse_search_cards(html):
+                    if c.url not in candidates_map:
+                        self.score_candidate(c, lawyer)
+                        if c.confidence > 0:
+                            candidates_map[c.url] = c
 
-            # Stop early if we already have a name-exact match
-            exact = [c for c in candidates_map.values()
-                     if c.name.lower() == full_name.lower()]
-            if exact:
+                # Stop early if we already have a high-confidence match
+                if any(c.confidence >= 0.90 for c in candidates_map.values()):
+                    break
+
+                await asyncio.sleep(random.uniform(0.8, 1.5))
+
+            if any(c.confidence >= 0.90 for c in candidates_map.values()):
                 break
 
-            await asyncio.sleep(random.uniform(0.8, 1.5))
-
-        candidates = list(candidates_map.values())
-
-        for c in candidates:
-            self.score_candidate(c, lawyer)
-
+        candidates = [c for c in candidates_map.values() if c.confidence > 0]
         candidates.sort(key=lambda c: c.confidence, reverse=True)
 
         logger.info(

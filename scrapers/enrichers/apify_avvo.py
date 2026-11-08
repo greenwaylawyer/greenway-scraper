@@ -187,9 +187,12 @@ class ApifyAvvoEnricher(BaseEnricher):
             logger.warning("Avvo search fetch returned no page", query=search_url)
             return []
 
-        candidates = AvvoEnricher._parse_search_cards(html)
-        for candidate in candidates:
+        raw_candidates = AvvoEnricher._parse_search_cards(html)
+        candidates: List[DiscoveryCandidate] = []
+        for candidate in raw_candidates:
             self.score_candidate(candidate, lawyer)
+            if candidate.confidence > 0:
+                candidates.append(candidate)
         candidates.sort(key=lambda c: c.confidence, reverse=True)
         return candidates
 

@@ -298,6 +298,16 @@ class JustiaEnricher(BaseEnricher):
         """
         # We try multiple location strategies because some records may have
         # missing/incorrect city values (or city from firm address vs license state).
+        identity = self.extract_lawyer_identity(lawyer)
+        full_name = identity["full_name"]
+        name_variants: List[str] = [full_name] if full_name else []
+        first_token = identity["first_token"]
+        last_token = identity["last_token"]
+        if first_token and last_token and first_token != last_token and len(identity["all_name_tokens"]) >= 3:
+            short_name = f"{first_token.capitalize()} {last_token.capitalize()}"
+            if short_name not in name_variants:
+                name_variants.append(short_name)
+
         city = (lawyer.get("city") or "").strip()
         state_code = (lawyer.get("license_state") or lawyer.get("state") or "").strip()
         state_name = self._state_code_to_name(state_code)
@@ -313,42 +323,46 @@ class JustiaEnricher(BaseEnricher):
 
         candidates_map: Dict[str, DiscoveryCandidate] = {}
 
-        for loc in locations_to_try:
-            search_lawyer = dict(lawyer)
-            search_lawyer["city"] = loc if loc else ""
+        for query_name in name_variants:
+            for loc in locations_to_try:
+                search_lawyer = dict(lawyer)
+                search_lawyer["full_name"] = query_name
+                search_lawyer["city"] = loc if loc else ""
 
-            search_url = self._build_search_url(search_lawyer)
-            logger.info(
-                "Justia discovery search",
-                url=search_url,
-                lawyer=lawyer.get("full_name"),
-                location=loc or "(none)",
-                bar_number=lawyer.get("bar_number"),
-            )
+                search_url = self._build_search_url(search_lawyer)
+                logger.info(
+                    "Justia discovery search",
+                    url=search_url,
+                    lawyer=query_name,
+                    location=loc or "(none)",
+                    bar_number=lawyer.get("bar_number"),
+                )
 
-            try:
-                html = await self._fetch_html(search_url)
-            except Exception as e:
-                logger.error("Justia search fetch failed", url=search_url, error=str(e))
-                continue
+                try:
+                    html = await self._fetch_html(search_url)
+                except Exception as e:
+                    logger.error("Justia search fetch failed", url=search_url, error=str(e))
+                    continue
 
-            new_candidates = [
-                c for c in self._parse_search_candidates(html)
-                if c.url not in candidates_map
-            ]
-            for c in new_candidates:
-                candidates_map[c.url] = c
+                for c in self._parse_search_candidates(html):
+                    if c.url not in candidates_map:
+                        self.score_candidate(c, lawyer)
+                        if c.confidence > 0:
+                            candidates_map[c.url] = c
 
-            # Stop trying more locations if we already found a strong match
-            exact = [c for c in candidates_map.values() if c.bar_number == str(lawyer.get("bar_number") or "")]
-            if exact:
-                logger.info("Justia: bar number match found early, stopping location loop")
+                # Stop trying more locations if we already found a strong match
+                if any(c.confidence >= 0.90 for c in candidates_map.values()):
+                    logger.info("Justia: high-confidence match found early, stopping location loop")
+                    break
+
+                # Short polite delay between search pages
+                await asyncio.sleep(random.uniform(0.8, 1.5))
+
+            if any(c.confidence >= 0.90 for c in candidates_map.values()):
                 break
 
-            # Short polite delay between search pages
-            await asyncio.sleep(random.uniform(0.8, 1.5))
-
-        candidates = list(candidates_map.values())
+        candidates = [c for c in candidates_map.values() if c.confidence > 0]
+        candidates.sort(key=lambda c: c.confidence, reverse=True)
 
         # Fetch top candidate profiles to get bar number for auto-merge
         max_profile_fetches = 5
@@ -365,9 +379,7 @@ class JustiaEnricher(BaseEnricher):
             # Short polite delay between profile fetches
             await asyncio.sleep(random.uniform(0.5, 1.2))
 
-        for candidate in candidates[max_profile_fetches:]:
-            self.score_candidate(candidate, lawyer)
-
+        candidates = [c for c in candidates if c.confidence > 0]
         candidates.sort(key=lambda c: c.confidence, reverse=True)
 
         logger.info(
