@@ -17,6 +17,18 @@ services:
     # Run scraper on-demand: docker exec greenway_scraper python run.py --state california --export-scraper --layer state_bars
     entrypoint: ["tail", "-f", "/dev/null"]
 
+  avvo_poller:
+    build: .
+    container_name: greenway_avvo_poller
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    networks:
+      - greenway_network
+    restart: unless-stopped
+    entrypoint: ["python", "run_enrichment.py", "--worker", "apify_avvo", "--poll-batches", "--poll-interval", "20"]
+
   # FlareSolverr: handles Cloudflare-protected sites (e.g. Justia, Avvo).
   # It launches a real Chrome browser internally and solves CF challenges,
   # then returns plain HTML to the scraper via a simple HTTP API.
