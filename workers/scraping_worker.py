@@ -153,7 +153,7 @@ class ScrapingWorker:
                         le.first_name,
                         le.last_name,
                         le.bar_number,
-                        le.license_state AS state,
+                        COALESCE(NULLIF(le.license_state, ''), NULLIF(le.state, '')) AS state,
                         le.city,
                         le.firm_name,
                         le.merged_data,

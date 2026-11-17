@@ -139,7 +139,8 @@ class DiscoveryWorker:
                         le.first_name,
                         le.last_name,
                         le.bar_number,
-                        le.license_state AS state,
+                        le.license_state AS license_state,
+                        COALESCE(NULLIF(le.license_state, ''), NULLIF(le.state, '')) AS state,
                         le.city,
                         le.firm_name,
                         le.merged_data
@@ -207,7 +208,7 @@ class DiscoveryWorker:
                 'last_name': request['last_name'] or merged_data.get('last_name'),
                 'bar_number': request.get('bar_number') or merged_data.get('bar_number'),
                 'state': request.get('state') or (addr.get('state') if isinstance(addr, dict) else None),
-                'license_state': request.get('state'),
+                'license_state': request.get('license_state') or request.get('state'),
                 'city': request.get('city') or (addr.get('city') if isinstance(addr, dict) else None),
                 'firm_name': request.get('firm_name') or merged_data.get('firm_name'),
                 'phone': merged_data.get('phone'),
