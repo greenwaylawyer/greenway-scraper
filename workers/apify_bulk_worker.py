@@ -110,6 +110,10 @@ class ApifyBulkWorker:
         self._batch_id: Optional[str] = None
         self._on_apify_status: Optional[Any] = None
         self.client = ApifyClient()
+        self._reset_stats()
+
+    def _reset_stats(self):
+        """Per-run counters. The batch poller is long-lived, so each batch must start from zero."""
         self.stats = {
             "selected": 0,
             "queries": 0,
@@ -937,6 +941,7 @@ class ApifyBulkWorker:
         self.mode = config.get("mode", "enrich")
         self.limit = config.get("limit")
         self.states = [s.lower() for s in (config.get("states") or [])]
+        self._reset_stats()
 
         async def on_apify_status(status: str) -> None:
             self._heartbeat("running", {"batch_id": batch_id, "apify_status": status})

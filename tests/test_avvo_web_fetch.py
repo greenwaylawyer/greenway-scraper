@@ -236,3 +236,23 @@ async def test_refresh_counts_failed_fetches():
     stats = await worker.run()
 
     assert stats["profile_fetch_failed"] == 1 and stats["merged"] == 0
+
+
+async def test_each_batch_starts_with_fresh_stats():
+    """The poller is long-lived; counters (incl. the listing-page cap) must not carry across batches."""
+    worker = make_worker({}, mode="discover")
+    worker.stats["listing_pages"] = 999  # leftover from earlier batches
+    worker.stats["inserted"] = 1024
+    worker._update_batch = lambda *a, **kw: worker.__dict__.setdefault("updates", []).append(kw)
+    worker._heartbeat = lambda *a, **kw: None
+    seen = {}
+
+    async def fake_run():
+        seen.update(worker.stats)
+        return worker.stats
+
+    worker.run = fake_run
+    await worker.process_batch({"batch_id": "b2", "config_snapshot": {"mode": "discover", "limit": 25, "states": ["NJ"]}})
+
+    assert seen["listing_pages"] == 0 and seen["inserted"] == 0
+    assert worker.updates[-1]["records_created"] == 0
