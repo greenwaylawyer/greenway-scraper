@@ -21,8 +21,11 @@ else
 fi
 
 log "Rebuilding and restarting..."
-docker compose build scraper
-docker compose up -d --force-recreate scraper
+# avvo_poller is a long-running Python process: the code is volume-mounted, but it
+# only picks up changes when the container restarts. An in-flight Avvo batch is cut
+# off; the autopilot fails it on its stall timeout.
+docker compose build scraper avvo_poller
+docker compose up -d --force-recreate scraper avvo_poller
 
 log "Cleaning old images..."
 docker image prune -f

@@ -15,4 +15,4 @@ jobs:
           key: ${{ secrets.DO_DROPLET_SSH_KEY }}
           port: 22
           script: |
-            su - jobaer -c 'cd /home/jobaer/greenway-scraper && bash deploy.sh'
+            su - jobaer -c 'cd /home/jobaer/greenway-scraper && git fetch origin main && git reset --hard origin/main && bash deploy.sh'
